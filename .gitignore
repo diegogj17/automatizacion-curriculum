@@ -14,6 +14,10 @@ logs/*.log
 # Token cache de Outlook (contiene tokens privados)
 data/token_cache.json
 
+# Configuración con secretos (emails, contraseñas, tokens)
+# Usa config.example.yaml como plantilla
+config.yaml
+
 # macOS
 .DS_Store
 

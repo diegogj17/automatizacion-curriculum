@@ -4,13 +4,13 @@
 
 # --- TU INFORMACIÓN PERSONAL ---
 personal:
-  nombre: "Diego García Jiménez"
-  email_remitente: "digaji17@gmail.com"
-  email_password: "cghv fooe ztma noso"
-  telefono: "+34 638 266 952"
-  linkedin: "https://www.linkedin.com/in/diego-garcia-jimenez-a76882174/"
-  github: "https://github.com/diegogj17"
-  ciudad: "Sanlucar de Barrameda, España"
+  nombre: "Tu Nombre Completo"
+  email_remitente: "tu_email@gmail.com"
+  email_password: "xxxx xxxx xxxx xxxx"   # Contraseña de aplicación de Gmail (16 caracteres)
+  telefono: "+34 600 000 000"
+  linkedin: "https://www.linkedin.com/in/tu-perfil/"
+  github: "https://github.com/tu-usuario"
+  ciudad: "Tu Ciudad, España"
   cv_es: "curriculum/CV_Diego_Garcia.pdf"         # CV en español
   cv_en: "curriculum/CV_Diego_Garcia_EN.pdf"       # CV en inglés (para Irlanda, UK, Alemania)
   cv_path: "curriculum/CV_Diego_Garcia.pdf"        # CV por defecto (español)
