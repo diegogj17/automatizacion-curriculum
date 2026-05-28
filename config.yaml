@@ -1,0 +1,138 @@
+# ============================================================
+#  CONFIGURACIÓN PRINCIPAL - Automatización de Curriculum
+# ============================================================
+
+# --- TU INFORMACIÓN PERSONAL ---
+personal:
+  nombre: "Diego García Jiménez"
+  email_remitente: "digaji17@gmail.com"
+  email_password: "cghv fooe ztma noso"
+  telefono: "+34 638 266 952"
+  linkedin: "https://www.linkedin.com/in/diego-garcia-jimenez-a76882174/"
+  github: "https://github.com/diegogj17"
+  ciudad: "Sanlucar de Barrameda, España"
+  cv_es: "curriculum/CV_Diego_Garcia.pdf"         # CV en español
+  cv_en: "curriculum/CV_Diego_Garcia_EN.pdf"       # CV en inglés (para Irlanda, UK, Alemania)
+  cv_path: "curriculum/CV_Diego_Garcia.pdf"        # CV por defecto (español)
+
+# --- ESPECIALIDADES (para personalizar emails) ---
+skills:
+  principales:
+    - "Flutter"
+    - "Dart"
+    - "Astro"
+  secundarias:
+    - "React"
+    - "JavaScript"
+    - "TypeScript"
+    - "Python"
+    - "HTML/CSS"
+    - "Firebase"
+    - "Supabase"
+  proyectos_destacados:
+    - nombre: "Flitly"
+      descripcion: "App de alquiler de material acuático entre usuarios, publicada en App Store y Google Play"
+      tecnologias: "Flutter, Dart"
+  años_experiencia: 1                           # Ajusta según tu caso
+  nivel: "Junior"                               # Junior / Mid / Senior
+
+# --- CONFIGURACIÓN DE OLLAMA ---
+ollama:
+  model: "llama3.1:8b"
+  base_url: "http://localhost:11434"
+  temperatura: 0.7
+
+# --- CONFIGURACIÓN DE CORREO ---
+email:
+  metodo: "gmail"              # gmail (recomendado) u outlook
+  asunto_template: "Candidatura espontánea - Desarrollador {nivel} | {nombre}"
+  max_emails_por_dia: 20
+  espera_entre_emails: 30
+
+# --- FUENTES DE BÚSQUEDA ---
+fuentes:
+  infojobs: true
+  linkedin: true
+  tecnoempleo: true
+  stackoverflow_jobs: true
+  busqueda_google: true
+  webs_directas: true
+  github: true
+
+# --- GITHUB API (opcional pero muy recomendado) ---
+# Obtén tu token gratuito en: https://github.com/settings/tokens
+# Solo necesita permisos de lectura pública (sin marcar nada extra)
+# Sin token: 60 peticiones/hora. Con token: 5000 peticiones/hora
+github:
+  token: ""   # pega aquí tu token: ghp_xxxxxxxxxxxxxxxxxxxx
+
+# --- LOCALIZACIÓN Y MERCADOS ---
+localizacion:
+  # España - ciudades por orden de preferencia
+  espana:
+    activo: true
+    ciudades:
+      - nombre: "Sevilla"
+        prioridad: 1
+      - nombre: "Málaga"
+        prioridad: 2
+      - nombre: "Madrid"
+        prioridad: 3
+      - nombre: "España"           # búsqueda general + remoto
+        prioridad: 4
+
+  # Mercados internacionales (CV en inglés)
+  internacional:
+    activo: true
+    paises:
+      - nombre: "Ireland"
+        idioma: "en"
+        ciudades: ["Dublin", "Belfast", "Cork", "Ireland"]
+      - nombre: "United Kingdom"
+        idioma: "en"
+        ciudades: ["London", "Manchester", "United Kingdom"]
+      - nombre: "Germany"
+        idioma: "en"               # buscar en inglés (muchas empresas tech en Alemania buscan en inglés)
+        ciudades: ["Berlin", "Munich", "Hamburg", "Germany"]
+
+# --- FILTROS DE BÚSQUEDA ---
+filtros:
+  # Términos para LinkedIn/Indeed/InfoJobs España - roles genéricos para máximos resultados
+  palabras_clave_es:
+    - "desarrollador"
+    - "programador"
+    - "developer"
+    - "desarrollador web"
+    - "desarrollador móvil"
+    - "frontend"
+    - "backend"
+    - "fullstack"
+    - "ingeniero software"
+    - "desarrollo software"
+  # Términos para LinkedIn/Indeed internacional - igual de genéricos
+  palabras_clave_en:
+    - "developer"
+    - "software engineer"
+    - "programmer"
+    - "frontend developer"
+    - "backend developer"
+    - "fullstack developer"
+    - "mobile developer"
+    - "web developer"
+    - "junior developer"
+    - "software developer"
+  modalidad: ["remoto", "presencial", "híbrido"]
+  excluir_palabras:
+    - "senior +5"
+    - "10 years experience"
+    - "10 años experiencia"
+  max_paginas: 5      # páginas por término/fuente (más páginas = más resultados pero más lento)
+
+# --- BASE DE DATOS ---
+database:
+  path: "data/empresas.db"
+
+# --- LOGS ---
+logs:
+  path: "logs/"
+  nivel: "INFO"

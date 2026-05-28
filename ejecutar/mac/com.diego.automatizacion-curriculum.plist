@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Identificador único del agente -->
+    <key>Label</key>
+    <string>com.diego.automatizacion-curriculum</string>
+
+    <!-- Comando a ejecutar -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/diegogarciajimenez/Documents/Automatizacion-Correos/main.py</string>
+    </array>
+
+    <!-- Directorio de trabajo -->
+    <key>WorkingDirectory</key>
+    <string>/Users/diegogarciajimenez/Documents/Automatizacion-Correos</string>
+
+    <!-- Ejecutar de lunes a viernes a las 9:30 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <!-- Logs de salida -->
+    <key>StandardOutPath</key>
+    <string>/Users/diegogarciajimenez/Documents/Automatizacion-Correos/logs/launchd_out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/diegogarciajimenez/Documents/Automatizacion-Correos/logs/launchd_err.log</string>
+
+    <!-- Reintentar si el Mac estaba apagado a la hora programada -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

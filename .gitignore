@@ -1,0 +1,21 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs (se generan localmente, no tiene sentido subirlos)
+logs/*.log
+
+# Token cache de Outlook (contiene tokens privados)
+data/token_cache.json
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
