@@ -356,35 +356,49 @@ def buscar_indeed(terminos: List[str], ciudad: str, pais: str,
 # ── GOOGLE CUSTOM SEARCH API + DUCKDUCKGO FALLBACK ───────────────────────────
 
 def _buscar_serper(query: str, serper_key: str,
-                   ciudad: str, pais: str, idioma: str) -> List[Dict]:
-    """Búsqueda via Serper.dev — resultados reales de Google, 2500/mes gratis."""
+                   ciudad: str, pais: str, idioma: str,
+                   max_paginas: int = 1) -> List[Dict]:
+    """
+    Búsqueda via Serper.dev — resultados reales de Google, 2500/mes gratis.
+    Pagina con el parámetro 'page' (10 resultados por página).
+    """
     resultados = []
-    try:
-        r = requests.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-            json={"q": query, "num": 10,
-                  "gl": "es" if idioma == "es" else "us",
-                  "hl": "es" if idioma == "es" else "en"},
-            timeout=10,
-        )
-        if r.status_code == 429:
-            logger.warning("Serper: cuota agotada (2500/mes)")
-            return []
-        if r.status_code != 200:
-            logger.warning(f"Serper: HTTP {r.status_code} — {r.text[:120]}")
-            return []
-        data = r.json()
-        for item in data.get("organic", []):
-            resultados.append(_empresa(
-                nombre      = item.get("title", ""),
-                descripcion = item.get("snippet", ""),
-                web         = item.get("link", ""),
-                email="", fuente="Google",
-                ciudad=ciudad, pais=pais, idioma=idioma,
-            ))
-    except Exception as e:
-        logger.warning(f"Serper [{query[:40]}]: {e}")
+    for pagina in range(1, max_paginas + 1):
+        try:
+            r = requests.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+                json={"q": query, "num": 10, "page": pagina,
+                      "gl": "es" if idioma == "es" else "us",
+                      "hl": "es" if idioma == "es" else "en"},
+                timeout=10,
+            )
+            if r.status_code == 429:
+                logger.warning("Serper: cuota agotada (2500/mes)")
+                break
+            if r.status_code != 200:
+                logger.warning(f"Serper: HTTP {r.status_code} — {r.text[:120]}")
+                break
+            data  = r.json()
+            items = data.get("organic", [])
+            if not items:
+                break
+            antes = len(resultados)
+            for item in items:
+                resultados.append(_empresa(
+                    nombre      = item.get("title", ""),
+                    descripcion = item.get("snippet", ""),
+                    web         = item.get("link", ""),
+                    email="", fuente="Google",
+                    ciudad=ciudad, pais=pais, idioma=idioma,
+                ))
+            logger.info(f"Serper [{query[:40]}...] pág {pagina}: +{len(resultados)-antes} (total {len(resultados)})")
+            if len(items) < 10:
+                break  # última página
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Serper [{query[:40]}]: {e}")
+            break
     return resultados
 
 
@@ -428,7 +442,7 @@ def _buscar_google_api(query: str, api_key: str, cx: str,
 
 def buscar_google(terminos: List[str], ciudad: str, pais: str,
                   idioma: str = "es", api_key: str = "", cx: str = "",
-                  serper_key: str = "") -> List[Dict]:
+                  serper_key: str = "", max_paginas: int = 3) -> List[Dict]:
     """
     Búsqueda de empresas tech en una ciudad/país.
     Prioridad: 1) Serper.dev  2) Google CSE  3) DuckDuckGo (fallback)
@@ -450,7 +464,8 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
     # ── 1. Serper.dev (Google real, 2500/mes gratis, sin tarjeta) ─────────────
     if serper_key:
         for query in queries:
-            nuevos = _buscar_serper(query, serper_key, ciudad, pais, idioma)
+            nuevos = _buscar_serper(query, serper_key, ciudad, pais, idioma,
+                                    max_paginas=max_paginas)
             resultados += nuevos
             logger.info(f"Serper [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
             time.sleep(0.5)
@@ -764,7 +779,7 @@ def buscar_todas_las_fuentes(config: dict) -> List[Dict]:
             if fuentes_cfg.get("busqueda_google"):
                 todas += buscar_google(terms_es, ciudad, "España", "es",
                                        api_key=google_key, cx=google_cx,
-                                       serper_key=serper_key)
+                                       serper_key=serper_key, max_paginas=max_pags)
 
         # GitHub para España (una sola llamada con todas las ciudades)
         if fuentes_cfg.get("github"):
@@ -790,7 +805,7 @@ def buscar_todas_las_fuentes(config: dict) -> List[Dict]:
                 if fuentes_cfg.get("busqueda_google"):
                     todas += buscar_google(terms_en, ciudad, pais, idioma,
                                            api_key=google_key, cx=google_cx,
-                                           serper_key=serper_key)
+                                           serper_key=serper_key, max_paginas=max_pags)
 
             # GitHub para este país (una sola llamada con todas sus ciudades)
             if fuentes_cfg.get("github"):
