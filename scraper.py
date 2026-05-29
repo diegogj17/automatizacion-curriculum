@@ -353,14 +353,86 @@ def buscar_indeed(terminos: List[str], ciudad: str, pais: str,
 
 # ── DUCKDUCKGO (reemplaza Google, más tolerante a scrapers) ──────────────────
 
-def buscar_google(terminos: List[str], ciudad: str, pais: str,
-                  idioma: str = "es") -> List[Dict]:
-    """
-    Búsqueda de empresas via DuckDuckGo HTML.
-    Más fiable que Google para scraping (no CAPTCHA, no JS obligatorio).
-    Incluye reintentos automáticos si DuckDuckGo devuelve 202 (rate limit suave).
-    """
+# ── GOOGLE CUSTOM SEARCH API + DUCKDUCKGO FALLBACK ───────────────────────────
+
+def _buscar_serper(query: str, serper_key: str,
+                   ciudad: str, pais: str, idioma: str) -> List[Dict]:
+    """Búsqueda via Serper.dev — resultados reales de Google, 2500/mes gratis."""
     resultados = []
+    try:
+        r = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+            json={"q": query, "num": 10,
+                  "gl": "es" if idioma == "es" else "us",
+                  "hl": "es" if idioma == "es" else "en"},
+            timeout=10,
+        )
+        if r.status_code == 429:
+            logger.warning("Serper: cuota agotada (2500/mes)")
+            return []
+        if r.status_code != 200:
+            logger.warning(f"Serper: HTTP {r.status_code} — {r.text[:120]}")
+            return []
+        data = r.json()
+        for item in data.get("organic", []):
+            resultados.append(_empresa(
+                nombre      = item.get("title", ""),
+                descripcion = item.get("snippet", ""),
+                web         = item.get("link", ""),
+                email="", fuente="Google",
+                ciudad=ciudad, pais=pais, idioma=idioma,
+            ))
+    except Exception as e:
+        logger.warning(f"Serper [{query[:40]}]: {e}")
+    return resultados
+
+
+def _buscar_google_api(query: str, api_key: str, cx: str,
+                       ciudad: str, pais: str, idioma: str) -> List[Dict]:
+    """Búsqueda via Google Custom Search JSON API (100/día gratis)."""
+    resultados = []
+    # La API devuelve max 10 por petición; podemos paginar con &start=
+    for start in [1, 11]:   # 2 páginas = hasta 20 resultados por query
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": api_key, "cx": cx, "q": query,
+                        "start": start, "num": 10},
+                timeout=10,
+            )
+            if r.status_code == 429:
+                logger.warning("Google CSE: cuota diaria agotada (100/día)")
+                break
+            if r.status_code != 200:
+                logger.warning(f"Google CSE: HTTP {r.status_code} — {r.text[:120]}")
+                break
+            data = r.json()
+            items = data.get("items", [])
+            if not items:
+                break
+            for item in items:
+                resultados.append(_empresa(
+                    nombre      = item.get("title", ""),
+                    descripcion = item.get("snippet", ""),
+                    web         = item.get("link", ""),
+                    email="", fuente="Google",
+                    ciudad=ciudad, pais=pais, idioma=idioma,
+                ))
+            time.sleep(1)
+        except Exception as e:
+            logger.warning(f"Google CSE [{query[:40]}]: {e}")
+            break
+    return resultados
+
+
+def buscar_google(terminos: List[str], ciudad: str, pais: str,
+                  idioma: str = "es", api_key: str = "", cx: str = "",
+                  serper_key: str = "") -> List[Dict]:
+    """
+    Búsqueda de empresas tech en una ciudad/país.
+    Prioridad: 1) Serper.dev  2) Google CSE  3) DuckDuckGo (fallback)
+    """
     queries = [
         f'empresa software tecnologia "{ciudad}" contacto',
         f'startup app desarrollo web "{ciudad}"',
@@ -370,8 +442,105 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
         queries = [
             f'tech company software "{ciudad}" contact',
             f'startup app development "{ciudad}"',
+            f'software agency "{ciudad}"',
         ]
 
+    resultados = []
+
+    # ── 1. Serper.dev (Google real, 2500/mes gratis, sin tarjeta) ─────────────
+    if serper_key:
+        for query in queries:
+            nuevos = _buscar_serper(query, serper_key, ciudad, pais, idioma)
+            resultados += nuevos
+            logger.info(f"Serper [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
+            time.sleep(0.5)
+        return resultados
+
+    # ── 2. Google Custom Search API ───────────────────────────────────────────
+    if api_key and cx:
+        for query in queries:
+            nuevos = _buscar_google_api(query, api_key, cx, ciudad, pais, idioma)
+            resultados += nuevos
+            logger.info(f"Google CSE [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
+            time.sleep(1)
+        return resultados
+
+    # ── 3. DuckDuckGo HTML (fallback sin API key) ─────────────────────────────
+    for query in queries:
+        intentos = 0
+        while intentos < 4:
+            try:
+                r = requests.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": query, "kl": "es-es" if idioma == "es" else "en-us"},
+                    headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=15,
+                )
+                if r.status_code == 202:
+                    espera = 8 + intentos * 5
+                    logger.info(f"DuckDuckGo [{ciudad}]: HTTP 202, esperando {espera}s...")
+                    time.sleep(espera)
+                    intentos += 1
+                    continue
+                if r.status_code != 200:
+                    logger.warning(f"DuckDuckGo [{ciudad}]: HTTP {r.status_code}")
+                    break
+                soup = BeautifulSoup(r.text, "html.parser")
+                antes = len(resultados)
+                for result in soup.select(".result"):
+                    try:
+                        titulo  = result.select_one(".result__title")
+                        a_tag   = result.select_one("a.result__a")
+                        snippet = result.select_one(".result__snippet")
+                        if not titulo or not a_tag:
+                            continue
+                        href = a_tag.get("href", "")
+                        if "uddg=" in href:
+                            from urllib.parse import unquote, urlparse, parse_qs
+                            qs = parse_qs(urlparse(href).query)
+                            href = unquote(qs.get("uddg", [href])[0])
+                        if not href.startswith("http"):
+                            continue
+                        resultados.append(_empresa(
+                            nombre      = titulo.get_text(strip=True),
+                            descripcion = snippet.get_text(strip=True) if snippet else "",
+                            web=href, email="", fuente="DuckDuckGo",
+                            ciudad=ciudad, pais=pais, idioma=idioma,
+                        ))
+                    except Exception:
+                        pass
+                logger.info(f"DuckDuckGo [{query[:45]}...] → +{len(resultados)-antes} (total {len(resultados)})")
+                break
+            except Exception as e:
+                logger.warning(f"DuckDuckGo [{ciudad}]: {e}")
+                break
+        time.sleep(4)
+
+    return resultados
+    queries = [
+        f'empresa software tecnologia "{ciudad}" contacto',
+        f'startup app desarrollo web "{ciudad}"',
+        f'agencia digital programacion "{ciudad}"',
+    ]
+    if idioma == "en":
+        queries = [
+            f'tech company software "{ciudad}" contact',
+            f'startup app development "{ciudad}"',
+            f'software agency "{ciudad}"',
+        ]
+
+    resultados = []
+
+    # ── Modo API Google ────────────────────────────────────────────────────────
+    if api_key and cx:
+        for query in queries:
+            nuevos = _buscar_google_api(query, api_key, cx, ciudad, pais, idioma)
+            resultados += nuevos
+            logger.info(f"Google CSE [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
+            time.sleep(1)
+        return resultados
+
+    # ── Fallback: DuckDuckGo HTML ──────────────────────────────────────────────
     for query in queries:
         intentos = 0
         max_intentos = 4
@@ -395,7 +564,6 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
 
                 soup = BeautifulSoup(r.text, "html.parser")
                 antes = len(resultados)
-
                 for result in soup.select(".result"):
                     try:
                         titulo  = result.select_one(".result__title")
@@ -418,16 +586,13 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
                         ))
                     except Exception:
                         pass
-
                 nuevos = len(resultados) - antes
                 logger.info(f"DuckDuckGo [{query[:45]}...] → +{nuevos} (total {len(resultados)})")
-                break  # éxito, salir del while
-
+                break
             except Exception as e:
                 logger.warning(f"DuckDuckGo [{ciudad}]: {e}")
                 break
-
-        time.sleep(4)  # pausa entre queries para no saturar
+        time.sleep(4)
 
     return resultados
 
@@ -577,6 +742,9 @@ def buscar_todas_las_fuentes(config: dict) -> List[Dict]:
     terms_en     = config["filtros"]["palabras_clave_en"]
     max_pags     = config["filtros"].get("max_paginas", 5)
     github_token = config.get("github", {}).get("token", "")
+    google_key   = config.get("google_search", {}).get("api_key", "")
+    google_cx    = config.get("google_search", {}).get("cx", "")
+    serper_key   = config.get("serper", {}).get("api_key", "")
     todas        = []
 
     # ── ESPAÑA ────────────────────────────────────────────────────────────────
@@ -594,7 +762,9 @@ def buscar_todas_las_fuentes(config: dict) -> List[Dict]:
             if fuentes_cfg.get("stackoverflow_jobs"):
                 todas += buscar_indeed(terms_es, ciudad, "España", "es", max_pags)
             if fuentes_cfg.get("busqueda_google"):
-                todas += buscar_google(terms_es, ciudad, "España", "es")
+                todas += buscar_google(terms_es, ciudad, "España", "es",
+                                       api_key=google_key, cx=google_cx,
+                                       serper_key=serper_key)
 
         # GitHub para España (una sola llamada con todas las ciudades)
         if fuentes_cfg.get("github"):
@@ -618,7 +788,9 @@ def buscar_todas_las_fuentes(config: dict) -> List[Dict]:
                 if fuentes_cfg.get("stackoverflow_jobs"):
                     todas += buscar_indeed(terms_en, ciudad, pais, idioma, max_pags)
                 if fuentes_cfg.get("busqueda_google"):
-                    todas += buscar_google(terms_en, ciudad, pais, idioma)
+                    todas += buscar_google(terms_en, ciudad, pais, idioma,
+                                           api_key=google_key, cx=google_cx,
+                                           serper_key=serper_key)
 
             # GitHub para este país (una sola llamada con todas sus ciudades)
             if fuentes_cfg.get("github"):
