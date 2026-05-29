@@ -358,9 +358,9 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
     """
     Búsqueda de empresas via DuckDuckGo HTML.
     Más fiable que Google para scraping (no CAPTCHA, no JS obligatorio).
+    Incluye reintentos automáticos si DuckDuckGo devuelve 202 (rate limit suave).
     """
     resultados = []
-    # Queries orientadas a encontrar empresas tech de la zona
     queries = [
         f'empresa software tecnologia "{ciudad}" contacto',
         f'startup app desarrollo web "{ciudad}"',
@@ -373,51 +373,61 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
         ]
 
     for query in queries:
-        try:
-            r = requests.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": query, "kl": "es-es" if idioma == "es" else "en-us"},
-                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15,
-            )
-            if r.status_code != 200:
-                logger.warning(f"DuckDuckGo [{ciudad}]: HTTP {r.status_code}")
-                continue
+        intentos = 0
+        max_intentos = 4
+        while intentos < max_intentos:
+            try:
+                r = requests.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": query, "kl": "es-es" if idioma == "es" else "en-us"},
+                    headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=15,
+                )
+                if r.status_code == 202:
+                    espera = 8 + intentos * 5
+                    logger.info(f"DuckDuckGo [{ciudad}]: HTTP 202, esperando {espera}s...")
+                    time.sleep(espera)
+                    intentos += 1
+                    continue
+                if r.status_code != 200:
+                    logger.warning(f"DuckDuckGo [{ciudad}]: HTTP {r.status_code}")
+                    break
 
-            soup = BeautifulSoup(r.text, "html.parser")
-            antes = len(resultados)
+                soup = BeautifulSoup(r.text, "html.parser")
+                antes = len(resultados)
 
-            for result in soup.select(".result"):
-                try:
-                    titulo  = result.select_one(".result__title")
-                    a_tag   = result.select_one("a.result__a")
-                    snippet = result.select_one(".result__snippet")
-                    if not titulo or not a_tag:
-                        continue
-                    href = a_tag.get("href", "")
-                    # DuckDuckGo a veces envuelve la URL; extraer la real
-                    if "uddg=" in href:
-                        from urllib.parse import unquote, urlparse, parse_qs
-                        qs = parse_qs(urlparse(href).query)
-                        href = unquote(qs.get("uddg", [href])[0])
-                    if not href.startswith("http"):
-                        continue
-                    resultados.append(_empresa(
-                        nombre      = titulo.get_text(strip=True),
-                        descripcion = snippet.get_text(strip=True) if snippet else "",
-                        web=href, email="", fuente="DuckDuckGo",
-                        ciudad=ciudad, pais=pais, idioma=idioma,
-                    ))
-                except Exception:
-                    pass
+                for result in soup.select(".result"):
+                    try:
+                        titulo  = result.select_one(".result__title")
+                        a_tag   = result.select_one("a.result__a")
+                        snippet = result.select_one(".result__snippet")
+                        if not titulo or not a_tag:
+                            continue
+                        href = a_tag.get("href", "")
+                        if "uddg=" in href:
+                            from urllib.parse import unquote, urlparse, parse_qs
+                            qs = parse_qs(urlparse(href).query)
+                            href = unquote(qs.get("uddg", [href])[0])
+                        if not href.startswith("http"):
+                            continue
+                        resultados.append(_empresa(
+                            nombre      = titulo.get_text(strip=True),
+                            descripcion = snippet.get_text(strip=True) if snippet else "",
+                            web=href, email="", fuente="DuckDuckGo",
+                            ciudad=ciudad, pais=pais, idioma=idioma,
+                        ))
+                    except Exception:
+                        pass
 
-            nuevos = len(resultados) - antes
-            logger.info(f"DuckDuckGo [{query[:40]}...] → +{nuevos} (total {len(resultados)})")
+                nuevos = len(resultados) - antes
+                logger.info(f"DuckDuckGo [{query[:45]}...] → +{nuevos} (total {len(resultados)})")
+                break  # éxito, salir del while
 
-        except Exception as e:
-            logger.warning(f"DuckDuckGo [{ciudad}]: {e}")
+            except Exception as e:
+                logger.warning(f"DuckDuckGo [{ciudad}]: {e}")
+                break
 
-        time.sleep(2.5)
+        time.sleep(4)  # pausa entre queries para no saturar
 
     return resultados
 
