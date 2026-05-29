@@ -94,6 +94,27 @@ class Database:
             ).fetchone()
             return row[0] > 0
 
+    def obtener_empresas_sin_email(self) -> List[Dict]:
+        """Devuelve empresas que tienen web pero no tienen email registrado."""
+        with self._conectar() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT * FROM empresas
+                WHERE web IS NOT NULL AND web != ''
+                  AND (email IS NULL OR email = '')
+                ORDER BY fecha_add ASC
+            """).fetchall()
+            return [dict(r) for r in rows]
+
+    def actualizar_email_empresa(self, empresa_id: int, email: str):
+        """Actualiza el email de una empresa ya guardada en BD."""
+        with self._conectar() as conn:
+            conn.execute(
+                "UPDATE empresas SET email = ? WHERE id = ?",
+                (email, empresa_id)
+            )
+        logger.info(f"Email actualizado en empresa id={empresa_id}: {email}")
+
     def obtener_empresas_pendientes(self) -> List[Dict]:
         """Devuelve empresas con email que aún no han sido contactadas."""
         with self._conectar() as conn:

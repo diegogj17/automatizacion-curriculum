@@ -36,10 +36,11 @@ echo ¿Qué quieres hacer?
 echo   1) Pipeline completo (buscar + filtrar + enviar)
 echo   2) Solo buscar empresas (sin enviar emails)
 echo   3) Solo enviar emails (empresas ya en BD)
-echo   4) Ver estadísticas
-echo   5) Probar conexión de email
+echo   4) Buscar emails en empresas de la BD (búsqueda exhaustiva)
+echo   5) Ver estadísticas
+echo   6) Probar conexión de email
 echo.
-set /p opcion="Elige una opción (1-5): "
+set /p opcion="Elige una opción (1-6): "
 
 if "%opcion%"=="1" (
     echo.
@@ -55,8 +56,12 @@ if "%opcion%"=="1" (
     python main.py --solo-enviar
 ) else if "%opcion%"=="4" (
     echo.
-    python main.py --estadisticas
+    echo 📧 Buscando emails exhaustivamente en empresas de la BD...
+    python main.py --buscar-emails
 ) else if "%opcion%"=="5" (
+    echo.
+    python main.py --estadisticas
+) else if "%opcion%"=="6" (
     echo.
     python main.py --test-smtp
 ) else (

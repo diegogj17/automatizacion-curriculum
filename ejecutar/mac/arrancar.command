@@ -31,10 +31,11 @@ echo "¿Qué quieres hacer?"
 echo "  1) Pipeline completo (buscar + filtrar + enviar)"
 echo "  2) Solo buscar empresas (sin enviar emails)"
 echo "  3) Solo enviar emails (empresas ya en BD)"
-echo "  4) Ver estadísticas"
-echo "  5) Probar conexión de email"
+echo "  4) Buscar emails en empresas de la BD (búsqueda exhaustiva)"
+echo "  5) Ver estadísticas"
+echo "  6) Probar conexión de email"
 echo ""
-read "opcion?Elige una opción (1-5): "
+read "opcion?Elige una opción (1-6): "
 
 case $opcion in
     1)
@@ -54,9 +55,15 @@ case $opcion in
         ;;
     4)
         echo ""
-        $PYTHON main.py --estadisticas
+        echo "📧 Buscando emails exhaustivamente en empresas de la BD..."
+        echo "   (Visita la web de cada empresa para encontrar su email de contacto)"
+        $PYTHON main.py --buscar-emails
         ;;
     5)
+        echo ""
+        $PYTHON main.py --estadisticas
+        ;;
+    6)
         echo ""
         $PYTHON main.py --test-smtp
         ;;

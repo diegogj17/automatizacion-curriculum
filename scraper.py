@@ -22,28 +22,141 @@ HEADERS = {
 }
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+# Dominios claramente falsos / de plantilla
+_DOMINIOS_FALSOS = {
+    "example.com", "ejemplo.com", "prueba.com", "test.com", "demo.com",
+    "sample.com", "placeholder.com", "tuempresa.com", "miempresa.com",
+    "yourcompany.com", "mycompany.com", "empresa.com", "companyname.com",
+    "correo.com", "email.com", "dominio.com", "sitio.com", "web.com",
+    "domain.com", "mailinator.com", "tempmail.com", "trashmail.com",
+    "yourdomain.com", "acme.com", "loremipsum.com",
+}
+
+# Partes locales del email claramente de relleno
+_LOCALES_FALSOS = {
+    "hola", "hello", "ejemplo", "example", "prueba", "test", "demo",
+    "sample", "noreply", "no-reply", "donotreply", "do-not-reply",
+    "change-this", "your-email", "tuemail", "tucorreo",
+}
+
 
 # ── UTILIDADES ────────────────────────────────────────────────────────────────
 
 def extraer_emails_de_html(html: str) -> List[str]:
-    excluir = {"png", "jpg", "jpeg", "gif", "svg", "woff", "ttf", "css", "js"}
-    emails = EMAIL_REGEX.findall(html)
-    return list({e.lower() for e in emails if e.split(".")[-1].lower() not in excluir})
+    """Extrae emails del HTML incluyendo patrones ofuscados."""
+    excluir_ext = {"png", "jpg", "jpeg", "gif", "svg", "woff", "ttf", "css", "js",
+                   "webp", "ico", "eot", "otf", "mp4", "mp3", "pdf", "zip"}
+    emails = set()
+
+    # 1. Regex estándar
+    for e in EMAIL_REGEX.findall(html):
+        emails.add(e.lower())
+
+    # 2. mailto: links
+    for m in re.findall(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', html):
+        emails.add(m.lower())
+
+    # 3. Ofuscaciones comunes: usuario [at] dominio [dot] com
+    for m in re.findall(
+        r'([a-zA-Z0-9._%+\-]+)\s*[\[\(]at[\]\)]\s*([a-zA-Z0-9.\-]+)\s*[\[\(]dot[\]\)]\s*([a-zA-Z]{2,})',
+        html, re.IGNORECASE
+    ):
+        emails.add(f"{m[0]}@{m[1]}.{m[2]}".lower())
+
+    # 4. Ofuscación: usuario (at) dominio.com
+    for m in re.findall(
+        r'([a-zA-Z0-9._%+\-]+)\s*[\[\(]at[\]\)]\s*([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})',
+        html, re.IGNORECASE
+    ):
+        emails.add(f"{m[0]}@{m[1]}".lower())
+
+    return [e for e in emails if e.split(".")[-1].lower() not in excluir_ext]
+
+
+def filtrar_emails_validos(emails: List[str]) -> List[str]:
+    """Descarta emails de plantilla, dominios falsos y locales de relleno."""
+    validos = []
+    for email in emails:
+        if "@" not in email:
+            continue
+        local, dominio = email.lower().split("@", 1)
+        if dominio in _DOMINIOS_FALSOS:
+            continue
+        if local in _LOCALES_FALSOS:
+            continue
+        # Descartar dominios con palabras sospechosas
+        if any(p in dominio for p in ("example", "prueba", "test.", "demo.", "sample")):
+            continue
+        validos.append(email)
+    return validos
+
+
+# Rutas a visitar en orden para buscar email de contacto
+_RUTAS_CONTACTO = [
+    "", "/contacto", "/contact", "/contact-us", "/contactanos",
+    "/sobre-nosotros", "/about", "/about-us", "/quienes-somos",
+    "/equipo", "/team", "/empresa", "/nosotros",
+    "/trabaja-con-nosotros", "/work-with-us", "/careers", "/empleo", "/jobs",
+    "/legal", "/privacidad", "/privacy", "/impressum",
+]
 
 
 def obtener_email_de_web(url: str) -> List[str]:
-    emails = []
-    paginas = [url, urljoin(url, "/contacto"), urljoin(url, "/contact"),
-               urljoin(url, "/sobre-nosotros"), urljoin(url, "/about")]
-    for pagina in paginas:
+    """Versión rápida (compatibilidad). Llama a la exhaustiva."""
+    return obtener_email_de_web_exhaustivo(url)
+
+
+def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8) -> List[str]:
+    """
+    Búsqueda exhaustiva de emails en la web de la empresa.
+    Visita múltiples rutas, extrae mailto:, texto ofuscado y meta tags.
+    """
+    if not url or not url.startswith("http"):
+        return []
+
+    emails_encontrados: List[str] = []
+    visitadas = 0
+
+    for ruta in _RUTAS_CONTACTO:
+        if visitadas >= max_paginas:
+            break
+        pagina_url = urljoin(url, ruta) if ruta else url
         try:
-            r = requests.get(pagina, headers=HEADERS, timeout=8)
-            if r.status_code == 200:
-                emails += extraer_emails_de_html(r.text)
+            r = requests.get(pagina_url, headers=HEADERS, timeout=10,
+                             allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            visitadas += 1
+
+            # Extraer emails del HTML completo
+            emails_encontrados += extraer_emails_de_html(r.text)
+
+            # También parsear con BeautifulSoup para mailto: en atributos href
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.lower().startswith("mailto:"):
+                    email_raw = href[7:].split("?")[0].strip()
+                    if "@" in email_raw:
+                        emails_encontrados.append(email_raw.lower())
+
+            # Meta tags (algunos ponen email ahí)
+            for meta in soup.find_all("meta"):
+                content = meta.get("content", "")
+                emails_encontrados += extraer_emails_de_html(content)
+
+            if emails_encontrados:
+                # Si ya tenemos emails de RRHH, podemos parar antes
+                buenos = [e for e in emails_encontrados
+                          if any(p in e for p in ("hr", "rrhh", "talent", "careers", "jobs", "empleo"))]
+                if buenos:
+                    break
+
         except Exception:
             pass
         time.sleep(1)
-    return list(set(emails))
+
+    return filtrar_emails_validos(list(set(emails_encontrados)))
 
 
 def get_soup(url: str) -> Optional[BeautifulSoup]:
@@ -238,36 +351,74 @@ def buscar_indeed(terminos: List[str], ciudad: str, pais: str,
     return resultados
 
 
-# ── GOOGLE (multi-país) ───────────────────────────────────────────────────────
+# ── DUCKDUCKGO (reemplaza Google, más tolerante a scrapers) ──────────────────
 
 def buscar_google(terminos: List[str], ciudad: str, pais: str,
                   idioma: str = "es") -> List[Dict]:
+    """
+    Búsqueda de empresas via DuckDuckGo HTML.
+    Más fiable que Google para scraping (no CAPTCHA, no JS obligatorio).
+    """
     resultados = []
-    queries = [f'empresa programacion contratar "{t}" "{ciudad}" email contacto'
-               for t in terminos[:2]]
+    # Queries orientadas a encontrar empresas tech de la zona
+    queries = [
+        f'empresa software tecnologia "{ciudad}" contacto',
+        f'startup app desarrollo web "{ciudad}"',
+        f'agencia digital programacion "{ciudad}"',
+    ]
+    if idioma == "en":
+        queries = [
+            f'tech company software "{ciudad}" contact',
+            f'startup app development "{ciudad}"',
+        ]
+
     for query in queries:
-        url = f"https://www.google.com/search?q={quote_plus(query)}&num=8"
-        soup = get_soup(url)
-        if not soup:
-            continue
-        for result in soup.select("div.g")[:6]:
-            try:
-                titulo  = result.select_one("h3")
-                link    = result.select_one("a")
-                snippet = result.select_one(".VwiC3b")
-                if titulo and link:
-                    href = link.get("href", "")
-                    if href.startswith("http"):
-                        resultados.append(_empresa(
-                            nombre      = titulo.get_text(strip=True),
-                            descripcion = snippet.get_text(strip=True) if snippet else "",
-                            web=href, email="", fuente="Google",
-                            ciudad=ciudad, pais=pais, idioma=idioma,
-                        ))
-            except Exception:
-                pass
-        logger.info(f"Google [{ciudad}]: {len(resultados)} resultados acum.")
-        time.sleep(3)
+        try:
+            r = requests.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query, "kl": "es-es" if idioma == "es" else "en-us"},
+                headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                logger.warning(f"DuckDuckGo [{ciudad}]: HTTP {r.status_code}")
+                continue
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            antes = len(resultados)
+
+            for result in soup.select(".result"):
+                try:
+                    titulo  = result.select_one(".result__title")
+                    a_tag   = result.select_one("a.result__a")
+                    snippet = result.select_one(".result__snippet")
+                    if not titulo or not a_tag:
+                        continue
+                    href = a_tag.get("href", "")
+                    # DuckDuckGo a veces envuelve la URL; extraer la real
+                    if "uddg=" in href:
+                        from urllib.parse import unquote, urlparse, parse_qs
+                        qs = parse_qs(urlparse(href).query)
+                        href = unquote(qs.get("uddg", [href])[0])
+                    if not href.startswith("http"):
+                        continue
+                    resultados.append(_empresa(
+                        nombre      = titulo.get_text(strip=True),
+                        descripcion = snippet.get_text(strip=True) if snippet else "",
+                        web=href, email="", fuente="DuckDuckGo",
+                        ciudad=ciudad, pais=pais, idioma=idioma,
+                    ))
+                except Exception:
+                    pass
+
+            nuevos = len(resultados) - antes
+            logger.info(f"DuckDuckGo [{query[:40]}...] → +{nuevos} (total {len(resultados)})")
+
+        except Exception as e:
+            logger.warning(f"DuckDuckGo [{ciudad}]: {e}")
+
+        time.sleep(2.5)
+
     return resultados
 
 
@@ -382,20 +533,26 @@ def buscar_github(ciudades: List[str], paises: List[str],
 
 # ── ENRIQUECIMIENTO DE EMAILS ─────────────────────────────────────────────────
 
+_PRIORIDAD_EMAIL = ["rrhh", "hr", "empleo", "talent", "jobs", "careers",
+                    "work", "recruit", "info", "contact", "hola"]
+
+
+def _elegir_mejor_email(emails: List[str]) -> str:
+    """De una lista de emails válidos, elige el más relevante para RRHH."""
+    for p in _PRIORIDAD_EMAIL:
+        match = next((e for e in emails if p in e.lower()), None)
+        if match:
+            return match
+    return emails[0]
+
+
 def enriquecer_con_emails(empresas: List[Dict]) -> List[Dict]:
-    prioridad = ["rrhh", "hr", "empleo", "talent", "jobs", "careers",
-                 "work", "recruit", "info", "contact", "hola"]
     for emp in empresas:
         if emp.get("web") and not emp.get("email"):
             logger.info(f"Buscando email en: {emp['web']}")
-            emails = obtener_email_de_web(emp["web"])
+            emails = obtener_email_de_web_exhaustivo(emp["web"])
             if emails:
-                elegido = emails[0]
-                for p in prioridad:
-                    match = next((e for e in emails if p in e.lower()), None)
-                    if match:
-                        elegido = match
-                        break
+                elegido = _elegir_mejor_email(emails)
                 emp["email"] = elegido
                 logger.info(f"  → {elegido}")
     return empresas

@@ -15,7 +15,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.expanduser("~/Library/Python/3.9/lib/python/site-packages"))
 
 from database     import Database
-from scraper      import buscar_todas_las_fuentes
+from scraper      import buscar_todas_las_fuentes, obtener_email_de_web_exhaustivo, filtrar_emails_validos, _elegir_mejor_email
 from ai_filter    import filtrar_y_personalizar
 from email_sender import EmailSender
 
@@ -45,6 +45,59 @@ def cargar_config(ruta: str = "config.yaml") -> dict:
 
 
 # ── PIPELINE PRINCIPAL ────────────────────────────────────────────────────────
+
+def buscar_emails_bd(config: dict):
+    """
+    Recorre TODAS las empresas de la BD que tienen web pero no tienen email
+    y realiza una búsqueda exhaustiva en su página web.
+    Ideal para ejecutar después de haber buscado empresas con --solo-buscar.
+    """
+    import time
+    logger = logging.getLogger(__name__)
+    db = Database(config["database"]["path"])
+
+    empresas = db.obtener_empresas_sin_email()
+    logger.info(f"\n{'='*60}")
+    logger.info(f"BÚSQUEDA EXHAUSTIVA DE EMAILS EN BD")
+    logger.info(f"{'='*60}")
+    logger.info(f"Empresas con web pero sin email: {len(empresas)}")
+
+    if not empresas:
+        logger.info("✅ Todas las empresas ya tienen email registrado.")
+        return
+
+    actualizadas = 0
+    sin_email    = 0
+
+    for i, emp in enumerate(empresas, 1):
+        logger.info(f"\n[{i}/{len(empresas)}] {emp['nombre']} → {emp['web']}")
+        try:
+            emails = obtener_email_de_web_exhaustivo(emp["web"])
+            if emails:
+                elegido = _elegir_mejor_email(emails)
+                db.actualizar_email_empresa(emp["id"], elegido)
+                logger.info(f"  ✅ Email encontrado: {elegido}")
+                if len(emails) > 1:
+                    logger.info(f"     (otros: {', '.join(emails[1:4])})")
+                actualizadas += 1
+            else:
+                logger.info(f"  ❌ No se encontró email")
+                sin_email += 1
+        except Exception as e:
+            logger.warning(f"  ⚠️  Error: {e}")
+            sin_email += 1
+        time.sleep(2)
+
+    logger.info(f"""
+{'='*60}
+📊 RESULTADO BÚSQUEDA DE EMAILS
+{'='*60}
+  Empresas procesadas:    {len(empresas)}
+  Emails encontrados:     {actualizadas}
+  Sin email:              {sin_email}
+{'='*60}
+""")
+
 
 def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
                       solo_enviar: bool = False, test_smtp: bool = False):
@@ -200,6 +253,7 @@ if __name__ == "__main__":
     parser.add_argument("--config",        default="config.yaml", help="Ruta al config.yaml")
     parser.add_argument("--solo-buscar",   action="store_true",   help="Solo busca y guarda empresas, no envía emails")
     parser.add_argument("--solo-enviar",   action="store_true",   help="Solo envía emails (usa empresas ya en BD)")
+    parser.add_argument("--buscar-emails", action="store_true",   help="Busca emails exhaustivamente en empresas de la BD sin email")
     parser.add_argument("--test-smtp",     action="store_true",   help="Prueba la conexión de correo")
     parser.add_argument("--estadisticas",  action="store_true",   help="Muestra estadísticas de la BD")
     args = parser.parse_args()
@@ -214,6 +268,10 @@ if __name__ == "__main__":
         db = Database(config["database"]["path"])
         resumen = db.resumen()
         print(f"\n📊 ESTADÍSTICAS:\n{resumen}\n")
+        sys.exit(0)
+
+    if args.buscar_emails:
+        buscar_emails_bd(config)
         sys.exit(0)
 
     ejecutar_pipeline(
