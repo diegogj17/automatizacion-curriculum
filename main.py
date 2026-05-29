@@ -123,16 +123,12 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         for e in empresas_crudas[:5]:
             logger.info(f"  • {e['nombre']} ({e['fuente']}) - Email: {e.get('email') or 'no encontrado'}")
 
-        # ── FASE 2: FILTRADO CON IA ────────────────────────────────────────────
-        logger.info("\n" + "=" * 60)
-        logger.info("FASE 2: Filtrando y personalizando con Mistral (Ollama)...")
-        logger.info("=" * 60)
-
-        empresas_filtradas = filtrar_y_personalizar(empresas_crudas, config)
-
-        # Guardar en BD
-        nuevas = 0
-        for emp in empresas_filtradas:
+        # ── GUARDAR EN BD ANTES DEL FILTRADO ──────────────────────────────────
+        # Se guardan TODAS las empresas encontradas (relevancia=0 por defecto).
+        # El filtrado IA después actualiza la relevancia; así no se pierde nada
+        # si Ollama falla o tarda mucho.
+        guardadas_pre = 0
+        for emp in empresas_crudas:
             id_emp = db.insertar_empresa(
                 nombre      = emp["nombre"],
                 email       = emp.get("email", ""),
@@ -142,12 +138,46 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
                 ciudad      = emp.get("ciudad", ""),
                 pais        = emp.get("pais", ""),
                 idioma      = emp.get("idioma", "es"),
-                relevancia  = emp.get("relevancia", 0),
+                relevancia  = 0,
             )
             if id_emp:
-                nuevas += 1
+                emp["_db_id"] = id_emp
+                guardadas_pre += 1
+        logger.info(f"\n💾 {guardadas_pre} empresas nuevas guardadas en BD (sin filtrar aún).")
 
-        logger.info(f"\n✅ {nuevas} empresas nuevas guardadas en la base de datos.")
+        # ── FASE 2: FILTRADO CON IA ────────────────────────────────────────────
+        logger.info("\n" + "=" * 60)
+        logger.info("FASE 2: Filtrando y personalizando con Mistral (Ollama)...")
+        logger.info("=" * 60)
+
+        empresas_filtradas = filtrar_y_personalizar(empresas_crudas, config)
+
+        # Actualizar relevancia y email generado en BD
+        nuevas = 0
+        for emp in empresas_filtradas:
+            # Si ya tenemos el id del insert previo, actualizamos relevancia
+            if emp.get("_db_id"):
+                with db._conectar() as conn:
+                    conn.execute(
+                        "UPDATE empresas SET relevancia=? WHERE id=?",
+                        (emp.get("relevancia", 5), emp["_db_id"])
+                    )
+                nuevas += 1
+            else:
+                # Empresa ya existía en BD antes de esta búsqueda → intentar insertar igualmente
+                db.insertar_empresa(
+                    nombre      = emp["nombre"],
+                    email       = emp.get("email", ""),
+                    web         = emp.get("web", ""),
+                    descripcion = emp.get("descripcion", ""),
+                    fuente      = emp.get("fuente", ""),
+                    ciudad      = emp.get("ciudad", ""),
+                    pais        = emp.get("pais", ""),
+                    idioma      = emp.get("idioma", "es"),
+                    relevancia  = emp.get("relevancia", 0),
+                )
+
+        logger.info(f"\n✅ {nuevas} empresas actualizadas con puntuación IA.")
 
         if solo_buscar:
             resumen = db.resumen()
