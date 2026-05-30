@@ -35,9 +35,16 @@ class Database:
                     pais        TEXT,
                     idioma      TEXT DEFAULT 'es',
                     relevancia  INTEGER DEFAULT 0,
-                    fecha_add   TEXT DEFAULT (datetime('now')),
-                    UNIQUE(email)
+                    fecha_add   TEXT DEFAULT (datetime('now'))
                 );
+
+                -- Índice único SOLO para emails reales (no nulos ni vacíos)
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_empresas_email
+                    ON empresas(email) WHERE email IS NOT NULL AND email != '';
+
+                -- Índice único para evitar duplicados por web cuando no hay email
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_empresas_web
+                    ON empresas(web) WHERE web IS NOT NULL AND web != '';
 
                 CREATE TABLE IF NOT EXISTS emails_enviados (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +53,7 @@ class Database:
                     asunto          TEXT,
                     cuerpo          TEXT,
                     fecha_envio     TEXT DEFAULT (datetime('now')),
-                    estado          TEXT DEFAULT 'enviado',   -- enviado / error / respondido
+                    estado          TEXT DEFAULT 'enviado',
                     respuesta       TEXT
                 );
 
@@ -58,13 +65,46 @@ class Database:
                     fecha       TEXT DEFAULT (datetime('now'))
                 );
             """)
-        # Migraciones: añadir columnas nuevas si no existen (bases de datos antiguas)
+        # Migraciones para bases de datos antiguas
         with self._conectar() as conn:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(empresas)")}
             if "pais" not in cols:
                 conn.execute("ALTER TABLE empresas ADD COLUMN pais TEXT DEFAULT ''")
             if "idioma" not in cols:
                 conn.execute("ALTER TABLE empresas ADD COLUMN idioma TEXT DEFAULT 'es'")
+            # Migrar: quitar la restricción UNIQUE(email) antigua que bloquea vacíos.
+            # SQLite no permite DROP CONSTRAINT, así que recreamos la tabla si tiene
+            # la columna email con UNIQUE en la definición original.
+            schema = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='empresas'"
+            ).fetchone()
+            if schema and "UNIQUE(email)" in schema[0]:
+                logger.info("Migrando BD: eliminando UNIQUE(email) antiguo...")
+                conn.executescript("""
+                    ALTER TABLE empresas RENAME TO empresas_old;
+                    CREATE TABLE empresas (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        nombre      TEXT NOT NULL,
+                        web         TEXT,
+                        email       TEXT,
+                        descripcion TEXT,
+                        fuente      TEXT,
+                        ciudad      TEXT,
+                        pais        TEXT,
+                        idioma      TEXT DEFAULT 'es',
+                        relevancia  INTEGER DEFAULT 0,
+                        fecha_add   TEXT DEFAULT (datetime('now'))
+                    );
+                    INSERT OR IGNORE INTO empresas
+                        SELECT id,nombre,web,email,descripcion,fuente,ciudad,pais,idioma,relevancia,fecha_add
+                        FROM empresas_old;
+                    DROP TABLE empresas_old;
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_empresas_email
+                        ON empresas(email) WHERE email IS NOT NULL AND email != '';
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_empresas_web
+                        ON empresas(web) WHERE web IS NOT NULL AND web != '';
+                """)
+                logger.info("Migración completada.")
         logger.info("Base de datos inicializada correctamente.")
 
     # ── EMPRESAS ──────────────────────────────────────────────────────────────
@@ -73,18 +113,25 @@ class Database:
                          descripcion: str = "", fuente: str = "", ciudad: str = "",
                          pais: str = "", idioma: str = "es",
                          relevancia: int = 0) -> Optional[int]:
-        """Inserta una empresa. Devuelve el ID o None si ya existía."""
+        """
+        Inserta una empresa. Devuelve el ID o None si ya existía.
+        - Emails/webs vacíos se almacenan como NULL para no violar el índice único.
+        - El índice único solo aplica a emails/webs reales (no nulos).
+        """
+        email_db = email.strip() if email and email.strip() else None
+        web_db   = web.strip()   if web   and web.strip()   else None
         try:
             with self._conectar() as conn:
                 cur = conn.execute(
-                    """INSERT INTO empresas (nombre, email, web, descripcion, fuente, ciudad, pais, idioma, relevancia)
+                    """INSERT INTO empresas
+                       (nombre, email, web, descripcion, fuente, ciudad, pais, idioma, relevancia)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (nombre, email, web, descripcion, fuente, ciudad, pais, idioma, relevancia)
+                    (nombre, email_db, web_db, descripcion, fuente, ciudad, pais, idioma, relevancia)
                 )
-                logger.info(f"Empresa guardada: {nombre} <{email}>")
+                logger.info(f"Empresa guardada: {nombre} <{email_db or 'sin email'}>")
                 return cur.lastrowid
         except sqlite3.IntegrityError:
-            logger.debug(f"Empresa ya existente (email duplicado): {email}")
+            logger.debug(f"Empresa ya existente (duplicada): {nombre} | {email_db or web_db}")
             return None
 
     def email_ya_contactado(self, email: str) -> bool:
