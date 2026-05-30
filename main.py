@@ -133,9 +133,8 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         total_guardadas = 0
 
         def _guardar_lote(empresas: list, etiqueta: str):
-            """Enriquece emails y guarda inmediatamente en BD."""
+            """Guarda directamente en BD sin buscar emails (eso es la opción 4)."""
             nonlocal total_guardadas
-            empresas = enriquecer_con_emails(empresas)
             nuevas = 0
             for emp in empresas:
                 id_emp = db.insertar_empresa(
