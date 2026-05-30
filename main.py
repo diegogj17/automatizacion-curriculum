@@ -15,7 +15,10 @@ from datetime import datetime
 sys.path.insert(0, os.path.expanduser("~/Library/Python/3.9/lib/python/site-packages"))
 
 from database     import Database
-from scraper      import buscar_todas_las_fuentes, obtener_email_de_web_exhaustivo, filtrar_emails_validos, _elegir_mejor_email
+from scraper      import (buscar_linkedin, buscar_tecnoempleo, buscar_infojobs,
+                          buscar_indeed, buscar_google, buscar_github,
+                          enriquecer_con_emails,
+                          obtener_email_de_web_exhaustivo, _elegir_mejor_email)
 from ai_filter    import filtrar_y_personalizar
 from email_sender import EmailSender
 
@@ -111,61 +114,31 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         sender.test_conexion()
         return
 
-    # ── FASE 1: BÚSQUEDA ──────────────────────────────────────────────────────
+    # ── FASE 1: BÚSQUEDA INCREMENTAL (guarda por ciudad) ─────────────────────
     if not solo_enviar:
         logger.info("=" * 60)
-        logger.info("FASE 1: Buscando empresas en todas las fuentes...")
+        logger.info("FASE 1: Buscando empresas (guardado incremental por ciudad)...")
         logger.info("=" * 60)
 
-        empresas_crudas = buscar_todas_las_fuentes(config)
+        fuentes_cfg  = config["fuentes"]
+        loc_cfg      = config["localizacion"]
+        terms_es     = config["filtros"]["palabras_clave_es"]
+        terms_en     = config["filtros"]["palabras_clave_en"]
+        max_pags     = config["filtros"].get("max_paginas", 5)
+        github_token = config.get("github", {}).get("token", "")
+        google_key   = config.get("google_search", {}).get("api_key", "")
+        google_cx    = config.get("google_search", {}).get("cx", "")
+        serper_key   = config.get("serper", {}).get("api_key", "")
 
-        logger.info(f"\nEjemplos de empresas encontradas:")
-        for e in empresas_crudas[:5]:
-            logger.info(f"  • {e['nombre']} ({e['fuente']}) - Email: {e.get('email') or 'no encontrado'}")
+        total_guardadas = 0
 
-        # ── GUARDAR EN BD ANTES DEL FILTRADO ──────────────────────────────────
-        # Se guardan TODAS las empresas encontradas (relevancia=0 por defecto).
-        # El filtrado IA después actualiza la relevancia; así no se pierde nada
-        # si Ollama falla o tarda mucho.
-        guardadas_pre = 0
-        for emp in empresas_crudas:
-            id_emp = db.insertar_empresa(
-                nombre      = emp["nombre"],
-                email       = emp.get("email", ""),
-                web         = emp.get("web", ""),
-                descripcion = emp.get("descripcion", ""),
-                fuente      = emp.get("fuente", ""),
-                ciudad      = emp.get("ciudad", ""),
-                pais        = emp.get("pais", ""),
-                idioma      = emp.get("idioma", "es"),
-                relevancia  = 0,
-            )
-            if id_emp:
-                emp["_db_id"] = id_emp
-                guardadas_pre += 1
-        logger.info(f"\n💾 {guardadas_pre} empresas nuevas guardadas en BD (sin filtrar aún).")
-
-        # ── FASE 2: FILTRADO CON IA ────────────────────────────────────────────
-        logger.info("\n" + "=" * 60)
-        logger.info("FASE 2: Filtrando y personalizando con Mistral (Ollama)...")
-        logger.info("=" * 60)
-
-        empresas_filtradas = filtrar_y_personalizar(empresas_crudas, config)
-
-        # Actualizar relevancia y email generado en BD
-        nuevas = 0
-        for emp in empresas_filtradas:
-            # Si ya tenemos el id del insert previo, actualizamos relevancia
-            if emp.get("_db_id"):
-                with db._conectar() as conn:
-                    conn.execute(
-                        "UPDATE empresas SET relevancia=? WHERE id=?",
-                        (emp.get("relevancia", 5), emp["_db_id"])
-                    )
-                nuevas += 1
-            else:
-                # Empresa ya existía en BD antes de esta búsqueda → intentar insertar igualmente
-                db.insertar_empresa(
+        def _guardar_lote(empresas: list, etiqueta: str):
+            """Enriquece emails y guarda inmediatamente en BD."""
+            nonlocal total_guardadas
+            empresas = enriquecer_con_emails(empresas)
+            nuevas = 0
+            for emp in empresas:
+                id_emp = db.insertar_empresa(
                     nombre      = emp["nombre"],
                     email       = emp.get("email", ""),
                     web         = emp.get("web", ""),
@@ -174,10 +147,96 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
                     ciudad      = emp.get("ciudad", ""),
                     pais        = emp.get("pais", ""),
                     idioma      = emp.get("idioma", "es"),
-                    relevancia  = emp.get("relevancia", 0),
+                    relevancia  = 0,
                 )
+                if id_emp:
+                    emp["_db_id"] = id_emp
+                    nuevas += 1
+            total_guardadas += nuevas
+            logger.info(f"💾 [{etiqueta}] +{nuevas} guardadas (total acum: {total_guardadas})")
+            return empresas
 
-        logger.info(f"\n✅ {nuevas} empresas actualizadas con puntuación IA.")
+        todas_crudas = []
+
+        # ── ESPAÑA ────────────────────────────────────────────────────────────
+        if loc_cfg["espana"]["activo"]:
+            ciudades_es = [c["nombre"] for c in
+                           sorted(loc_cfg["espana"]["ciudades"], key=lambda x: x["prioridad"])]
+            for ciudad in ciudades_es:
+                logger.info(f"\n{'─'*50}\n🏙️  España / {ciudad}\n{'─'*50}")
+                lote = []
+                if fuentes_cfg.get("linkedin"):
+                    lote += buscar_linkedin(terms_es, ciudad, "España", "es", max_pags)
+                if fuentes_cfg.get("tecnoempleo"):
+                    lote += buscar_tecnoempleo(terms_es, ciudad, max_pags)
+                if fuentes_cfg.get("infojobs"):
+                    lote += buscar_infojobs(terms_es, ciudad, max_pags)
+                if fuentes_cfg.get("stackoverflow_jobs"):
+                    lote += buscar_indeed(terms_es, ciudad, "España", "es", max_pags)
+                if fuentes_cfg.get("busqueda_google"):
+                    lote += buscar_google(terms_es, ciudad, "España", "es",
+                                          api_key=google_key, cx=google_cx,
+                                          serper_key=serper_key, max_paginas=max_pags)
+                lote = _guardar_lote(lote, f"España/{ciudad}")
+                todas_crudas += lote
+
+            # GitHub para España
+            if fuentes_cfg.get("github"):
+                logger.info(f"\n{'─'*50}\n🐙 GitHub / España\n{'─'*50}")
+                lote = buscar_github(ciudades=ciudades_es, paises=["Spain", "España"],
+                                     idioma_email="es", token=github_token)
+                lote = _guardar_lote(lote, "GitHub/España")
+                todas_crudas += lote
+
+        # ── INTERNACIONAL ─────────────────────────────────────────────────────
+        if loc_cfg["internacional"]["activo"]:
+            for pais_cfg in loc_cfg["internacional"]["paises"]:
+                pais   = pais_cfg["nombre"]
+                idioma = pais_cfg["idioma"]
+                for ciudad in pais_cfg["ciudades"]:
+                    logger.info(f"\n{'─'*50}\n🌍 {pais} / {ciudad}\n{'─'*50}")
+                    lote = []
+                    if fuentes_cfg.get("linkedin"):
+                        lote += buscar_linkedin(terms_en, ciudad, pais, idioma, max_pags)
+                    if fuentes_cfg.get("stackoverflow_jobs"):
+                        lote += buscar_indeed(terms_en, ciudad, pais, idioma, max_pags)
+                    if fuentes_cfg.get("busqueda_google"):
+                        lote += buscar_google(terms_en, ciudad, pais, idioma,
+                                              api_key=google_key, cx=google_cx,
+                                              serper_key=serper_key, max_paginas=max_pags)
+                    lote = _guardar_lote(lote, f"{pais}/{ciudad}")
+                    todas_crudas += lote
+
+                # GitHub para este país
+                if fuentes_cfg.get("github"):
+                    logger.info(f"\n{'─'*50}\n🐙 GitHub / {pais}\n{'─'*50}")
+                    lote = buscar_github(ciudades=pais_cfg["ciudades"], paises=[pais],
+                                         idioma_email=idioma, token=github_token)
+                    lote = _guardar_lote(lote, f"GitHub/{pais}")
+                    todas_crudas += lote
+
+        logger.info(f"\n✅ Búsqueda completada. Total guardadas en BD: {total_guardadas}")
+        empresas_crudas = todas_crudas
+
+        # ── FASE 2: FILTRADO CON IA ────────────────────────────────────────────
+        logger.info("\n" + "=" * 60)
+        logger.info("FASE 2: Filtrando y personalizando con Ollama...")
+        logger.info("=" * 60)
+
+        empresas_filtradas = filtrar_y_personalizar(empresas_crudas, config)
+
+        # Actualizar relevancia en BD para las empresas filtradas
+        actualizadas_ia = 0
+        for emp in empresas_filtradas:
+            if emp.get("_db_id"):
+                with db._conectar() as conn:
+                    conn.execute(
+                        "UPDATE empresas SET relevancia=? WHERE id=?",
+                        (emp.get("relevancia", 5), emp["_db_id"])
+                    )
+                actualizadas_ia += 1
+
+        logger.info(f"\n✅ {actualizadas_ia} empresas actualizadas con puntuación IA.")
 
         if solo_buscar:
             resumen = db.resumen()
