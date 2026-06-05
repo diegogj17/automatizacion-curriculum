@@ -10,6 +10,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Asegurar que los paquetes --user son accesibles
 sys.path.insert(0, os.path.expanduser("~/Library/Python/3.9/lib/python/site-packages"))
@@ -235,10 +236,10 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         sender.test_conexion()
         return
 
-    # ── FASE 1: BÚSQUEDA INCREMENTAL (guarda por ciudad) ─────────────────────
+    # ── FASE 1: BÚSQUEDA EN PARALELO (guarda al completar cada tarea) ────────
     if not solo_enviar:
         logger.info("=" * 60)
-        logger.info("FASE 1: Buscando empresas (guardado incremental por ciudad)...")
+        logger.info("FASE 1: Buscando empresas EN PARALELO (guardado incremental)...")
         logger.info("=" * 60)
 
         fuentes_cfg  = config["fuentes"]
@@ -277,65 +278,74 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
             return empresas
 
         todas_crudas = []
+        tareas = []   # cada tarea = (funcion, args, etiqueta) → se ejecuta en paralelo
 
-        # ── ESPAÑA ────────────────────────────────────────────────────────────
+        # ── ESPAÑA: una tarea por (fuente × ciudad) ────────────────────────────
         if loc_cfg["espana"]["activo"]:
             ciudades_es = [c["nombre"] for c in
                            sorted(loc_cfg["espana"]["ciudades"], key=lambda x: x["prioridad"])]
             for ciudad in ciudades_es:
-                logger.info(f"\n{'─'*50}\n🏙️  España / {ciudad}\n{'─'*50}")
-                lote = []
                 if fuentes_cfg.get("linkedin"):
-                    lote += buscar_linkedin(terms_es, ciudad, "España", "es", max_pags)
+                    tareas.append((buscar_linkedin, (terms_es, ciudad, "España", "es", max_pags),
+                                   f"LinkedIn España/{ciudad}"))
                 if fuentes_cfg.get("tecnoempleo"):
-                    lote += buscar_tecnoempleo(terms_es, ciudad, max_pags)
+                    tareas.append((buscar_tecnoempleo, (terms_es, ciudad, max_pags),
+                                   f"Tecnoempleo España/{ciudad}"))
                 if fuentes_cfg.get("infojobs"):
-                    lote += buscar_infojobs(terms_es, ciudad, max_pags)
+                    tareas.append((buscar_infojobs, (terms_es, ciudad, max_pags),
+                                   f"InfoJobs España/{ciudad}"))
                 if fuentes_cfg.get("stackoverflow_jobs"):
-                    lote += buscar_indeed(terms_es, ciudad, "España", "es", max_pags)
+                    tareas.append((buscar_indeed, (terms_es, ciudad, "España", "es", max_pags),
+                                   f"Indeed España/{ciudad}"))
                 if fuentes_cfg.get("busqueda_google"):
-                    lote += buscar_google(terms_es, ciudad, "España", "es",
-                                          api_key=google_key, cx=google_cx,
-                                          serper_key=serper_key, max_paginas=max_pags)
-                lote = _guardar_lote(lote, f"España/{ciudad}")
-                todas_crudas += lote
-
-            # GitHub para España
+                    tareas.append((buscar_google,
+                                   (terms_es, ciudad, "España", "es",
+                                    google_key, google_cx, serper_key, max_pags),
+                                   f"Google España/{ciudad}"))
             if fuentes_cfg.get("github"):
-                logger.info(f"\n{'─'*50}\n🐙 GitHub / España\n{'─'*50}")
-                lote = buscar_github(ciudades=ciudades_es, paises=["Spain", "España"],
-                                     idioma_email="es", token=github_token)
-                lote = _guardar_lote(lote, "GitHub/España")
-                todas_crudas += lote
+                tareas.append((buscar_github, (ciudades_es, ["Spain", "España"], "es", github_token),
+                               "GitHub/España"))
 
-        # ── INTERNACIONAL ─────────────────────────────────────────────────────
+        # ── INTERNACIONAL: una tarea por (fuente × ciudad) ─────────────────────
         if loc_cfg["internacional"]["activo"]:
             for pais_cfg in loc_cfg["internacional"]["paises"]:
                 pais   = pais_cfg["nombre"]
                 idioma = pais_cfg["idioma"]
                 for ciudad in pais_cfg["ciudades"]:
-                    logger.info(f"\n{'─'*50}\n🌍 {pais} / {ciudad}\n{'─'*50}")
-                    lote = []
                     if fuentes_cfg.get("linkedin"):
-                        lote += buscar_linkedin(terms_en, ciudad, pais, idioma, max_pags)
+                        tareas.append((buscar_linkedin, (terms_en, ciudad, pais, idioma, max_pags),
+                                       f"LinkedIn {pais}/{ciudad}"))
                     if fuentes_cfg.get("stackoverflow_jobs"):
-                        lote += buscar_indeed(terms_en, ciudad, pais, idioma, max_pags)
+                        tareas.append((buscar_indeed, (terms_en, ciudad, pais, idioma, max_pags),
+                                       f"Indeed {pais}/{ciudad}"))
                     if fuentes_cfg.get("busqueda_google"):
-                        lote += buscar_google(terms_en, ciudad, pais, idioma,
-                                              api_key=google_key, cx=google_cx,
-                                              serper_key=serper_key, max_paginas=max_pags)
-                    lote = _guardar_lote(lote, f"{pais}/{ciudad}")
-                    todas_crudas += lote
-
-                # GitHub para este país
+                        tareas.append((buscar_google,
+                                       (terms_en, ciudad, pais, idioma,
+                                        google_key, google_cx, serper_key, max_pags),
+                                       f"Google {pais}/{ciudad}"))
                 if fuentes_cfg.get("github"):
-                    logger.info(f"\n{'─'*50}\n🐙 GitHub / {pais}\n{'─'*50}")
-                    lote = buscar_github(ciudades=pais_cfg["ciudades"], paises=[pais],
-                                         idioma_email=idioma, token=github_token)
-                    lote = _guardar_lote(lote, f"GitHub/{pais}")
-                    todas_crudas += lote
+                    tareas.append((buscar_github, (pais_cfg["ciudades"], [pais], idioma, github_token),
+                                   f"GitHub/{pais}"))
 
-        # ── EURES (portal europeo de empleo, pan-europeo) ──────────────────────
+        # ── EJECUCIÓN EN PARALELO (guardado en el hilo principal = SQLite OK) ──
+        workers = config["filtros"].get("busqueda_workers", 6)
+        logger.info(f"🚀 Lanzando {len(tareas)} búsquedas EN PARALELO "
+                    f"(workers={workers})...")
+        completadas = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futuros = {ex.submit(fn, *args): etiqueta for fn, args, etiqueta in tareas}
+            for fut in as_completed(futuros):
+                etiqueta = futuros[fut]
+                try:
+                    lote = fut.result()
+                except Exception as e:
+                    logger.warning(f"⚠️  [{etiqueta}] error: {e}")
+                    lote = []
+                completadas += 1
+                lote = _guardar_lote(lote, f"{etiqueta} [{completadas}/{len(tareas)}]")
+                todas_crudas += lote
+
+        # ── EURES (pan-europeo; ya paraleliza internamente → se ejecuta aparte) ─
         if fuentes_cfg.get("eures"):
             logger.info(f"\n{'─'*50}\n🇪🇺 EURES / Europa (UE + EEE + Suiza)\n{'─'*50}")
             if serper_key:

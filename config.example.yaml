@@ -129,6 +129,7 @@ filtros:
     - "10 años experiencia"
   max_paginas: 5      # páginas por término/fuente (más páginas = más resultados pero más lento)
   eures_paginas: 2    # páginas Serper por país en la búsqueda EURES (16 países × 2 queries)
+  busqueda_workers: 6  # fuentes/ciudades buscadas EN PARALELO (sube a 8-10 si tu red aguanta)
 
 # --- BASE DE DATOS ---
 database:
