@@ -140,6 +140,22 @@ class Database:
                 )
             """)
 
+        # Migración: columnas 'email_buscado' y 'fecha_busqueda_email' en empresas (BD antiguas)
+        # email_buscado = 1 → ya se intentó buscar su email (aunque no se encontrase)
+        # Así la opción 4 no vuelve a perder tiempo en webs que ya no dan email.
+        with self._conectar() as conn:
+            cols_emp = {row[1] for row in conn.execute("PRAGMA table_info(empresas)")}
+            if "email_buscado" not in cols_emp:
+                conn.execute("ALTER TABLE empresas ADD COLUMN email_buscado INTEGER DEFAULT 0")
+            if "fecha_busqueda_email" not in cols_emp:
+                conn.execute("ALTER TABLE empresas ADD COLUMN fecha_busqueda_email TEXT")
+            # Las que ya tienen email en emails_empresa → marcarlas como buscadas
+            conn.execute("""
+                UPDATE empresas SET email_buscado = 1
+                WHERE id IN (SELECT DISTINCT empresa_id FROM emails_empresa)
+                  AND email_buscado = 0
+            """)
+
         # Migración: volcar emails que estaban en empresas.email a emails_empresa
         with self._conectar() as conn:
             conn.execute("""
@@ -185,20 +201,30 @@ class Database:
 
     def obtener_empresas_sin_email(self) -> List[Dict]:
         """
-        Empresas que tienen web pero NO tienen ningún email registrado
-        (ni en empresas.email ni en la tabla emails_empresa).
+        Empresas que tienen web, NO tienen emails registrados
+        Y todavía NO se han buscado (email_buscado = 0).
+        Las que ya se intentaron y no dieron resultado no vuelven a procesarse.
         """
         with self._conectar() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT e.* FROM empresas e
                 WHERE e.web IS NOT NULL AND e.web != ''
+                  AND e.email_buscado = 0
                   AND NOT EXISTS (
                       SELECT 1 FROM emails_empresa em WHERE em.empresa_id = e.id
                   )
                 ORDER BY e.fecha_add ASC
             """).fetchall()
             return [dict(r) for r in rows]
+
+    def marcar_empresa_buscada(self, empresa_id: int):
+        """Marca que ya se intentó buscar el email de esta empresa (con o sin resultado)."""
+        with self._conectar() as conn:
+            conn.execute(
+                "UPDATE empresas SET email_buscado = 1, fecha_busqueda_email = datetime('now') WHERE id = ?",
+                (empresa_id,)
+            )
 
     def agregar_emails_empresa(self, empresa_id: int, emails: List[str],
                                principal: Optional[str] = None) -> int:
@@ -307,6 +333,12 @@ class Database:
             empresas_con_email = conn.execute(
                 "SELECT COUNT(DISTINCT empresa_id) FROM emails_empresa"
             ).fetchone()[0]
+            por_buscar = conn.execute("""
+                SELECT COUNT(*) FROM empresas
+                WHERE web IS NOT NULL AND web != ''
+                  AND email_buscado = 0
+                  AND NOT EXISTS (SELECT 1 FROM emails_empresa em WHERE em.empresa_id = empresas.id)
+            """).fetchone()[0]
             total_enviados = conn.execute("SELECT COUNT(*) FROM emails_enviados").fetchone()[0]
             enviados_hoy   = conn.execute(
                 "SELECT COUNT(*) FROM emails_enviados WHERE DATE(fecha_envio) = DATE('now')"
@@ -318,11 +350,12 @@ class Database:
                 "SELECT COUNT(*) FROM emails_empresa WHERE enviado = 0"
             ).fetchone()[0]
             return {
-                "total_empresas":     total_empresas,
-                "total_emails":       total_emails,
-                "empresas_con_email": empresas_con_email,
-                "emails_pendientes":  pendientes,
-                "total_enviados":     total_enviados,
-                "enviados_hoy":       enviados_hoy,
-                "errores":            errores,
+                "total_empresas":       total_empresas,
+                "total_emails":         total_emails,
+                "empresas_con_email":   empresas_con_email,
+                "webs_por_buscar":      por_buscar,
+                "emails_pendientes":    pendientes,
+                "total_enviados":       total_enviados,
+                "enviados_hoy":         enviados_hoy,
+                "errores":              errores,
             }

@@ -143,15 +143,18 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
 
                     if elegido and todos:
                         # Guardar TODOS los emails de la empresa (el mejor como principal).
-                        # agregar_emails_empresa deduplica globalmente (INSERT OR IGNORE).
                         nuevos = db.agregar_emails_empresa(emp["id"], todos, principal=elegido)
                         if nuevos > 0:
                             total_emails += nuevos
                             emails_lote.append((emp["nombre"], todos))
                         else:
-                            total_sin += 1   # todos los emails ya existían
+                            total_sin += 1
                     else:
                         total_sin += 1
+
+                    # Marcar SIEMPRE como buscada (con o sin resultado)
+                    # → no se volverá a intentar en futuras ejecuciones
+                    db.marcar_empresa_buscada(emp["id"])
 
                     _barra_progreso(hechos, len(lote), total_emails)
 
@@ -446,13 +449,14 @@ if __name__ == "__main__":
 {'='*60}
 📊  ESTADÍSTICAS DE LA BASE DE DATOS
 {'='*60}
-  🏢 Empresas en BD:            {r['total_empresas']:,}
-  📧 Emails recopilados:        {r['total_emails']:,}
-     └─ en empresas distintas:  {r['empresas_con_email']:,}
-  ✉️  Emails enviados (total):   {r['total_enviados']:,}
-     └─ hoy:                    {r['enviados_hoy']:,}
-  ⏳ Emails pendientes:         {r['emails_pendientes']:,}
-  ❌ Errores de envío:          {r['errores']:,}
+  🏢 Empresas en BD:              {r['total_empresas']:,}
+  📧 Emails recopilados:          {r['total_emails']:,}
+     └─ en empresas distintas:    {r['empresas_con_email']:,}
+  🔍 Webs pendientes de buscar:   {r['webs_por_buscar']:,}  ← opción 4
+  ✉️  Emails enviados (total):     {r['total_enviados']:,}
+     └─ hoy:                      {r['enviados_hoy']:,}
+  ⏳ Emails pendientes de enviar: {r['emails_pendientes']:,}
+  ❌ Errores de envío:            {r['errores']:,}
 {'='*60}
 """)
         sys.exit(0)
