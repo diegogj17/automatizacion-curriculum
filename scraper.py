@@ -7,9 +7,18 @@ import requests
 import logging
 import time
 import re
+import warnings
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urljoin
 from typing import List, Dict, Optional
+
+# Silenciar warnings molestos de BeautifulSoup al encontrar XML (sitemaps, feeds…)
+try:
+    from bs4 import XMLParsedAsHTMLWarning, MarkupResemblesLocatorWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +83,37 @@ def extraer_emails_de_html(html: str) -> List[str]:
 
 
 def filtrar_emails_validos(emails: List[str]) -> List[str]:
-    """Descarta emails de plantilla, dominios falsos y locales de relleno."""
+    """
+    Descarta emails de plantilla, dominios falsos, locales de relleno
+    y direcciones con estructura inválida (TLD roto, hashes de tracking…).
+    """
+    # TLD válido: solo letras, 2 a 24 caracteres (.es, .com, .technology…)
+    tld_valido = re.compile(r"^[a-zA-Z]{2,24}$")
+    # Extensiones de archivo que NO son TLDs reales (emails extraídos de rutas de imagen)
+    ext_archivo = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp",
+                   "css", "js", "json", "xml", "pdf", "zip", "woff", "woff2",
+                   "ttf", "eot", "otf", "mp4", "mp3", "avif", "tiff"}
     validos = []
     for email in emails:
-        if "@" not in email:
+        email = email.strip().lower()
+        if email.count("@") != 1:
             continue
-        local, dominio = email.lower().split("@", 1)
+        local, dominio = email.split("@", 1)
+
+        # Estructura mínima
+        if not local or "." not in dominio:
+            continue
+        tld = dominio.rsplit(".", 1)[-1]
+        # TLD debe ser solo letras (descarta "fairhall.es7", "dominio.es7"…)
+        if not tld_valido.match(tld):
+            continue
+        # TLD no puede ser una extensión de archivo (descarta "foto@empresa.png")
+        if tld in ext_archivo:
+            continue
+        # Local no puede empezar/terminar con punto ni tener dobles puntos
+        if local.startswith(".") or local.endswith(".") or ".." in local:
+            continue
+
         if dominio in _DOMINIOS_FALSOS:
             continue
         if local in _LOCALES_FALSOS:
@@ -87,6 +121,10 @@ def filtrar_emails_validos(emails: List[str]) -> List[str]:
         # Descartar dominios con palabras sospechosas
         if any(p in dominio for p in ("example", "prueba", "test.", "demo.", "sample")):
             continue
+        # Descartar hashes de tracking (sentry, wixpress) y locales larguísimos
+        if len(local) > 40 or any(p in dominio for p in ("sentry.", "wixpress.", "sentry-next")):
+            continue
+
         validos.append(email)
     return validos
 
@@ -106,10 +144,16 @@ def obtener_email_de_web(url: str) -> List[str]:
     return obtener_email_de_web_exhaustivo(url)
 
 
-def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8) -> List[str]:
+def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8,
+                                    timeout: int = 8, pausa: float = 0.0) -> List[str]:
     """
     Búsqueda exhaustiva de emails en la web de la empresa.
     Visita múltiples rutas, extrae mailto:, texto ofuscado y meta tags.
+
+    Args:
+        max_paginas: nº máximo de rutas a visitar por web.
+        timeout: segundos máx. de espera por petición HTTP.
+        pausa: segundos a esperar entre páginas (0 = sin pausa, ideal para concurrencia).
     """
     if not url or not url.startswith("http"):
         return []
@@ -122,7 +166,7 @@ def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8) -> List[str]
             break
         pagina_url = urljoin(url, ruta) if ruta else url
         try:
-            r = requests.get(pagina_url, headers=HEADERS, timeout=10,
+            r = requests.get(pagina_url, headers=HEADERS, timeout=timeout,
                              allow_redirects=True)
             if r.status_code != 200:
                 continue
@@ -154,7 +198,8 @@ def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8) -> List[str]
 
         except Exception:
             pass
-        time.sleep(1)
+        if pausa > 0:
+            time.sleep(pausa)
 
     return filtrar_emails_validos(list(set(emails_encontrados)))
 

@@ -57,6 +57,17 @@ class Database:
                     respuesta       TEXT
                 );
 
+                -- Todos los emails de cada empresa (relación uno-a-muchos).
+                -- email UNIQUE global → evita contactar el mismo buzón dos veces
+                -- aunque aparezca en varias empresas.
+                CREATE TABLE IF NOT EXISTS emails_empresa (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    empresa_id  INTEGER REFERENCES empresas(id),
+                    email       TEXT NOT NULL UNIQUE,
+                    principal   INTEGER DEFAULT 0,   -- 1 = email preferido (rrhh/empleo…)
+                    fecha_add   TEXT DEFAULT (datetime('now'))
+                );
+
                 CREATE TABLE IF NOT EXISTS log_busquedas (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     fuente      TEXT,
@@ -105,6 +116,14 @@ class Database:
                         ON empresas(web) WHERE web IS NOT NULL AND web != '';
                 """)
                 logger.info("Migración completada.")
+
+        # Migración: volcar emails que estaban en empresas.email a emails_empresa
+        with self._conectar() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO emails_empresa (empresa_id, email, principal)
+                SELECT id, email, 1 FROM empresas
+                WHERE email IS NOT NULL AND email != ''
+            """)
         logger.info("Base de datos inicializada correctamente.")
 
     # ── EMPRESAS ──────────────────────────────────────────────────────────────
@@ -142,37 +161,89 @@ class Database:
             return row[0] > 0
 
     def obtener_empresas_sin_email(self) -> List[Dict]:
-        """Devuelve empresas que tienen web pero no tienen email registrado."""
-        with self._conectar() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("""
-                SELECT * FROM empresas
-                WHERE web IS NOT NULL AND web != ''
-                  AND (email IS NULL OR email = '')
-                ORDER BY fecha_add ASC
-            """).fetchall()
-            return [dict(r) for r in rows]
-
-    def actualizar_email_empresa(self, empresa_id: int, email: str):
-        """Actualiza el email de una empresa ya guardada en BD."""
-        with self._conectar() as conn:
-            conn.execute(
-                "UPDATE empresas SET email = ? WHERE id = ?",
-                (email, empresa_id)
-            )
-        logger.info(f"Email actualizado en empresa id={empresa_id}: {email}")
-
-    def obtener_empresas_pendientes(self) -> List[Dict]:
-        """Devuelve empresas con email que aún no han sido contactadas."""
+        """
+        Empresas que tienen web pero NO tienen ningún email registrado
+        (ni en empresas.email ni en la tabla emails_empresa).
+        """
         with self._conectar() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT e.* FROM empresas e
-                WHERE e.email IS NOT NULL AND e.email != ''
-                  AND e.email NOT IN (SELECT email_destino FROM emails_enviados)
-                ORDER BY e.relevancia DESC, e.fecha_add ASC
+                WHERE e.web IS NOT NULL AND e.web != ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM emails_empresa em WHERE em.empresa_id = e.id
+                  )
+                ORDER BY e.fecha_add ASC
             """).fetchall()
             return [dict(r) for r in rows]
+
+    def agregar_emails_empresa(self, empresa_id: int, emails: List[str],
+                               principal: Optional[str] = None) -> int:
+        """
+        Guarda TODOS los emails de una empresa en la tabla emails_empresa.
+        - Usa INSERT OR IGNORE: si un email ya existe (en cualquier empresa),
+          se omite, evitando contactar dos veces el mismo buzón.
+        - 'principal' marca el email preferido (rrhh/empleo/contacto…).
+        - También rellena empresas.email con el principal si estaba vacío.
+        Devuelve el nº de emails NUEVOS insertados.
+        """
+        if not emails:
+            return 0
+        if principal is None:
+            principal = emails[0]
+
+        nuevos = 0
+        with self._conectar() as conn:
+            for email in emails:
+                email = email.strip().lower()
+                if not email or "@" not in email:
+                    continue
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO emails_empresa (empresa_id, email, principal)
+                       VALUES (?, ?, ?)""",
+                    (empresa_id, email, 1 if email == principal.strip().lower() else 0)
+                )
+                if cur.rowcount > 0:
+                    nuevos += 1
+            # Rellenar empresas.email (principal) si está vacío, ignorando duplicados
+            try:
+                conn.execute(
+                    "UPDATE empresas SET email = ? WHERE id = ? AND (email IS NULL OR email = '')",
+                    (principal.strip().lower(), empresa_id)
+                )
+            except sqlite3.IntegrityError:
+                pass
+        if nuevos:
+            logger.info(f"empresa id={empresa_id}: +{nuevos} emails guardados")
+        return nuevos
+
+    def actualizar_email_empresa(self, empresa_id: int, email: str) -> bool:
+        """Compatibilidad: guarda un único email como principal."""
+        return self.agregar_emails_empresa(empresa_id, [email], principal=email) > 0
+
+    def obtener_destinos_pendientes(self) -> List[Dict]:
+        """
+        Devuelve TODOS los emails pendientes de contactar (uno por fila),
+        con los datos de su empresa. Un email se considera pendiente si no
+        aparece en emails_enviados. Ordenados por relevancia de la empresa.
+        Cada dict incluye: id (empresa), nombre, web, idioma, relevancia,
+        ciudad, pais, descripcion y 'email' (el destino concreto).
+        """
+        with self._conectar() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT e.id, e.nombre, e.web, e.descripcion, e.ciudad,
+                       e.pais, e.idioma, e.relevancia, em.email AS email
+                FROM emails_empresa em
+                JOIN empresas e ON e.id = em.empresa_id
+                WHERE em.email NOT IN (SELECT email_destino FROM emails_enviados)
+                ORDER BY e.relevancia DESC, em.principal DESC, e.fecha_add ASC
+            """).fetchall()
+            return [dict(r) for r in rows]
+
+    def obtener_empresas_pendientes(self) -> List[Dict]:
+        """Compatibilidad: alias de obtener_destinos_pendientes()."""
+        return self.obtener_destinos_pendientes()
 
     def total_empresas(self) -> int:
         with self._conectar() as conn:
@@ -201,6 +272,10 @@ class Database:
     def resumen(self) -> dict:
         with self._conectar() as conn:
             total_empresas = conn.execute("SELECT COUNT(*) FROM empresas").fetchone()[0]
+            total_emails   = conn.execute("SELECT COUNT(*) FROM emails_empresa").fetchone()[0]
+            empresas_con_email = conn.execute(
+                "SELECT COUNT(DISTINCT empresa_id) FROM emails_empresa"
+            ).fetchone()[0]
             total_enviados = conn.execute("SELECT COUNT(*) FROM emails_enviados").fetchone()[0]
             enviados_hoy   = conn.execute(
                 "SELECT COUNT(*) FROM emails_enviados WHERE DATE(fecha_envio) = DATE('now')"
@@ -208,9 +283,16 @@ class Database:
             errores        = conn.execute(
                 "SELECT COUNT(*) FROM emails_enviados WHERE estado = 'error'"
             ).fetchone()[0]
+            pendientes = conn.execute("""
+                SELECT COUNT(*) FROM emails_empresa
+                WHERE email NOT IN (SELECT email_destino FROM emails_enviados)
+            """).fetchone()[0]
             return {
-                "total_empresas":  total_empresas,
-                "total_enviados":  total_enviados,
-                "enviados_hoy":    enviados_hoy,
-                "errores":         errores,
+                "total_empresas":     total_empresas,
+                "total_emails":       total_emails,
+                "empresas_con_email": empresas_con_email,
+                "emails_pendientes":  pendientes,
+                "total_enviados":     total_enviados,
+                "enviados_hoy":       enviados_hoy,
+                "errores":            errores,
             }

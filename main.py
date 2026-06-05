@@ -49,55 +49,139 @@ def cargar_config(ruta: str = "config.yaml") -> dict:
 
 # ── PIPELINE PRINCIPAL ────────────────────────────────────────────────────────
 
-def buscar_emails_bd(config: dict):
+def _barra_progreso(actual: int, total: int, encontrados: int, ancho: int = 38):
+    """Dibuja una barra de progreso que se sobreescribe en la misma línea."""
+    pct   = actual / total if total else 1
+    lleno = int(ancho * pct)
+    barra = "█" * lleno + "░" * (ancho - lleno)
+    sys.stdout.write(
+        f"\r  [{barra}] {actual}/{total} ({pct*100:3.0f}%)  ·  📧 {encontrados} emails"
+    )
+    sys.stdout.flush()
+
+
+def _procesar_email_empresa(emp: dict) -> tuple:
     """
-    Recorre TODAS las empresas de la BD que tienen web pero no tienen email
-    y realiza una búsqueda exhaustiva en su página web.
-    Ideal para ejecutar después de haber buscado empresas con --solo-buscar.
+    Worker concurrente: busca el email de una empresa (solo I/O de red).
+    No toca la BD — devuelve el resultado para que lo guarde el hilo principal.
+    Devuelve (emp, email_elegido_o_None, lista_completa).
     """
-    import time
+    try:
+        emails = obtener_email_de_web_exhaustivo(
+            emp["web"], max_paginas=6, timeout=6, pausa=0.0
+        )
+        if emails:
+            return (emp, _elegir_mejor_email(emails), emails)
+        return (emp, None, [])
+    except Exception:
+        return (emp, None, [])
+
+
+def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
+    """
+    Recorre las empresas de la BD que tienen web pero no email y busca su email
+    de contacto de forma CONCURRENTE y por LOTES.
+
+    - workers: nº de webs procesadas en paralelo (más = más rápido, más red).
+    - tam_lote: empresas por tramo; tras cada tramo se limpia la pantalla y se
+      muestra un resumen, para que la terminal no se sature.
+    - Guarda en BD según va encontrando emails (no se pierde nada si se corta).
+    - Se puede cancelar con Ctrl+C en cualquier momento sin perder lo guardado.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     logger = logging.getLogger(__name__)
     db = Database(config["database"]["path"])
 
+    # Permitir override desde config.yaml
+    em_cfg   = config.get("emails_busqueda", {})
+    workers  = em_cfg.get("workers", workers)
+    tam_lote = em_cfg.get("tam_lote", tam_lote)
+
     empresas = db.obtener_empresas_sin_email()
-    logger.info(f"\n{'='*60}")
-    logger.info(f"BÚSQUEDA EXHAUSTIVA DE EMAILS EN BD")
-    logger.info(f"{'='*60}")
-    logger.info(f"Empresas con web pero sin email: {len(empresas)}")
+    total = len(empresas)
+
+    print("\n" + "=" * 60)
+    print("📧  BÚSQUEDA DE EMAILS (concurrente por lotes)")
+    print("=" * 60)
+    print(f"  Empresas con web pero sin email: {total}")
+    print(f"  Procesando {workers} webs en paralelo, en lotes de {tam_lote}")
+    print("=" * 60)
 
     if not empresas:
-        logger.info("✅ Todas las empresas ya tienen email registrado.")
+        print("✅ Todas las empresas ya tienen email registrado.\n")
         return
 
-    actualizadas = 0
-    sin_email    = 0
+    # Silenciar el ruido del scraper durante la barra de progreso
+    nivel_previo = logging.getLogger("scraper").level
+    logging.getLogger("scraper").setLevel(logging.ERROR)
 
-    for i, emp in enumerate(empresas, 1):
-        logger.info(f"\n[{i}/{len(empresas)}] {emp['nombre']} → {emp['web']}")
-        try:
-            emails = obtener_email_de_web_exhaustivo(emp["web"])
-            if emails:
-                elegido = _elegir_mejor_email(emails)
-                db.actualizar_email_empresa(emp["id"], elegido)
-                logger.info(f"  ✅ Email encontrado: {elegido}")
-                if len(emails) > 1:
-                    logger.info(f"     (otros: {', '.join(emails[1:4])})")
-                actualizadas += 1
+    total_emails = 0
+    total_sin    = 0
+    procesadas   = 0
+    encontrados_detalle = []   # para mostrar al final de cada lote
+
+    try:
+        # Dividir en lotes
+        for inicio in range(0, total, tam_lote):
+            lote = empresas[inicio:inicio + tam_lote]
+            num_lote = inicio // tam_lote + 1
+            total_lotes = (total + tam_lote - 1) // tam_lote
+
+            print(f"\n🔄 Lote {num_lote}/{total_lotes}  "
+                  f"(empresas {inicio+1}–{min(inicio+tam_lote, total)})")
+
+            emails_lote = []
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futuros = {executor.submit(_procesar_email_empresa, emp): emp
+                           for emp in lote}
+                hechos = 0
+                for futuro in as_completed(futuros):
+                    emp, elegido, todos = futuro.result()
+                    hechos     += 1
+                    procesadas += 1
+
+                    if elegido and todos:
+                        # Guardar TODOS los emails de la empresa (el mejor como principal).
+                        # agregar_emails_empresa deduplica globalmente (INSERT OR IGNORE).
+                        nuevos = db.agregar_emails_empresa(emp["id"], todos, principal=elegido)
+                        if nuevos > 0:
+                            total_emails += nuevos
+                            emails_lote.append((emp["nombre"], todos))
+                        else:
+                            total_sin += 1   # todos los emails ya existían
+                    else:
+                        total_sin += 1
+
+                    _barra_progreso(hechos, len(lote), total_emails)
+
+            # Resumen del lote
+            print()  # salto tras la barra
+            if emails_lote:
+                print(f"  ✅ {len(emails_lote)} empresas con email en este lote:")
+                for nombre, mails in emails_lote[:10]:
+                    muestra = ", ".join(mails[:3])
+                    extra   = f" (+{len(mails)-3})" if len(mails) > 3 else ""
+                    print(f"     • {nombre[:32]:32s} → {muestra}{extra}")
+                if len(emails_lote) > 10:
+                    print(f"     … y {len(emails_lote)-10} empresas más")
             else:
-                logger.info(f"  ❌ No se encontró email")
-                sin_email += 1
-        except Exception as e:
-            logger.warning(f"  ⚠️  Error: {e}")
-            sin_email += 1
-        time.sleep(2)
+                print("  ❌ Sin emails nuevos en este lote")
+            print(f"  Progreso global: {procesadas}/{total}  ·  "
+                  f"📧 {total_emails} emails  ·  ⏭️  {total_sin} sin email")
 
-    logger.info(f"""
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Cancelado por el usuario. Lo encontrado ya está guardado en BD.")
+    finally:
+        logging.getLogger("scraper").setLevel(nivel_previo)
+
+    print(f"""
 {'='*60}
-📊 RESULTADO BÚSQUEDA DE EMAILS
+📊  RESULTADO FINAL
 {'='*60}
-  Empresas procesadas:    {len(empresas)}
-  Emails encontrados:     {actualizadas}
-  Sin email:              {sin_email}
+  Empresas procesadas:    {procesadas}/{total}
+  ✅ Emails encontrados:   {total_emails}
+  ⏭️  Sin email:           {total_sin}
 {'='*60}
 """)
 
@@ -254,8 +338,9 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         logger.warning(f"⚠️  Límite diario alcanzado ({max_hoy} emails). Vuelve mañana.")
         return
 
-    pendientes = db.obtener_empresas_pendientes()
-    logger.info(f"Empresas pendientes de contactar: {len(pendientes)}")
+    pendientes = db.obtener_destinos_pendientes()
+    logger.info(f"Emails pendientes de contactar: {len(pendientes)} "
+                f"(se envía a todos los correos de cada empresa)")
 
     enviados = 0
     errores  = 0
@@ -304,6 +389,8 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
 📊 RESUMEN FINAL
 {'='*60}
   Empresas en BD:        {resumen['total_empresas']}
+  Emails recopilados:    {resumen['total_emails']}  (en {resumen['empresas_con_email']} empresas)
+  Emails pendientes:     {resumen['emails_pendientes']}
   Emails enviados hoy:   {enviados}
   Errores hoy:           {errores}
   Total enviados:        {resumen['total_enviados']}
