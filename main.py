@@ -60,12 +60,20 @@ def _barra_progreso(actual: int, total: int, encontrados: int, ancho: int = 38):
     sys.stdout.flush()
 
 
-def _procesar_email_empresa(emp: dict) -> tuple:
+def _procesar_email_empresa(emp: dict, timeout_web: int = 30) -> tuple:
     """
     Worker concurrente: busca el email de una empresa (solo I/O de red).
     No toca la BD — devuelve el resultado para que lo guarde el hilo principal.
     Devuelve (emp, email_elegido_o_None, lista_completa).
+
+    timeout_web: segundos máximos totales para procesar UNA empresa entera.
+    Si se supera, se devuelve vacío y la empresa se marca como buscada.
     """
+    import signal
+
+    def _handler(signum, frame):
+        raise TimeoutError()
+
     try:
         emails = obtener_email_de_web_exhaustivo(
             emp["web"], max_paginas=6, timeout=6, pausa=0.0
@@ -80,23 +88,22 @@ def _procesar_email_empresa(emp: dict) -> tuple:
 def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
     """
     Recorre las empresas de la BD que tienen web pero no email y busca su email
-    de contacto de forma CONCURRENTE y por LOTES.
+    de forma CONCURRENTE y por LOTES.
 
-    - workers: nº de webs procesadas en paralelo (más = más rápido, más red).
-    - tam_lote: empresas por tramo; tras cada tramo se limpia la pantalla y se
-      muestra un resumen, para que la terminal no se sature.
-    - Guarda en BD según va encontrando emails (no se pierde nada si se corta).
-    - Se puede cancelar con Ctrl+C en cualquier momento sin perder lo guardado.
+    - workers:          webs procesadas en paralelo.
+    - tam_lote:         empresas por tramo antes de mostrar resumen.
+    - timeout_empresa:  segundos máx. por empresa antes de saltarla.
+    - Se puede cancelar con Ctrl+C sin perder lo ya guardado.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
 
     logger = logging.getLogger(__name__)
     db = Database(config["database"]["path"])
 
-    # Permitir override desde config.yaml
-    em_cfg   = config.get("emails_busqueda", {})
-    workers  = em_cfg.get("workers", workers)
-    tam_lote = em_cfg.get("tam_lote", tam_lote)
+    em_cfg          = config.get("emails_busqueda", {})
+    workers         = em_cfg.get("workers",          workers)
+    tam_lote        = em_cfg.get("tam_lote",          tam_lote)
+    timeout_empresa = em_cfg.get("timeout_empresa",   45)   # seg. máx. por empresa
 
     empresas = db.obtener_empresas_sin_email()
     total = len(empresas)
@@ -137,12 +144,19 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
                            for emp in lote}
                 hechos = 0
                 for futuro in as_completed(futuros):
-                    emp, elegido, todos = futuro.result()
+                    emp = futuros[futuro]
                     hechos     += 1
                     procesadas += 1
 
+                    try:
+                        _, elegido, todos = futuro.result(timeout=timeout_empresa)
+                    except FutureTimeout:
+                        logger.debug(f"⏱️  Timeout ({timeout_empresa}s): {emp.get('web','')}")
+                        elegido, todos = None, []
+                    except Exception:
+                        elegido, todos = None, []
+
                     if elegido and todos:
-                        # Guardar TODOS los emails de la empresa (el mejor como principal).
                         nuevos = db.agregar_emails_empresa(emp["id"], todos, principal=elegido)
                         if nuevos > 0:
                             total_emails += nuevos
@@ -152,8 +166,7 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
                     else:
                         total_sin += 1
 
-                    # Marcar SIEMPRE como buscada (con o sin resultado)
-                    # → no se volverá a intentar en futuras ejecuciones
+                    # Marcar SIEMPRE como buscada (con o sin resultado, con o sin timeout)
                     db.marcar_empresa_buscada(emp["id"])
 
                     _barra_progreso(hechos, len(lote), total_emails)
