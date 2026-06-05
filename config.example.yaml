@@ -58,6 +58,7 @@ fuentes:
   busqueda_google: true
   webs_directas: true
   github: true
+  eures: true        # portal europeo de empleo (búsqueda pan-europea vía Serper)
 
 # --- GITHUB API (opcional pero muy recomendado) ---
 # Obtén tu token gratuito en: https://github.com/settings/tokens
@@ -127,6 +128,7 @@ filtros:
     - "10 years experience"
     - "10 años experiencia"
   max_paginas: 5      # páginas por término/fuente (más páginas = más resultados pero más lento)
+  eures_paginas: 2    # páginas Serper por país en la búsqueda EURES (16 países × 2 queries)
 
 # --- BASE DE DATOS ---
 database:

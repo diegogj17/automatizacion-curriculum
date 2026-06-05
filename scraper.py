@@ -9,8 +9,9 @@ import time
 import re
 import warnings
 from bs4 import BeautifulSoup
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Silenciar warnings molestos de BeautifulSoup al encontrar XML (sitemaps, feeds…)
 try:
@@ -145,38 +146,63 @@ def obtener_email_de_web(url: str) -> List[str]:
 
 
 def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8,
-                                    timeout: int = 8, pausa: float = 0.0) -> List[str]:
+                                    timeout: int = 8, pausa: float = 0.0,
+                                    tiempo_max: float = 25.0) -> List[str]:
     """
     Búsqueda exhaustiva de emails en la web de la empresa.
     Visita múltiples rutas, extrae mailto:, texto ofuscado y meta tags.
 
     Args:
         max_paginas: nº máximo de rutas a visitar por web.
-        timeout: segundos máx. de espera por petición HTTP.
-        pausa: segundos a esperar entre páginas (0 = sin pausa, ideal para concurrencia).
+        timeout: segundos máx. de espera de LECTURA por petición HTTP.
+        pausa: segundos a esperar entre páginas (0 = sin pausa).
+        tiempo_max: PRESUPUESTO TOTAL en segundos para toda la web.
+                    Si se supera, se devuelve lo encontrado hasta el momento.
+                    Esto garantiza que nunca se quede pillado.
     """
     if not url or not url.startswith("http"):
         return []
 
+    inicio = time.monotonic()
     emails_encontrados: List[str] = []
     visitadas = 0
+    # timeout de tupla: (connect=3s, read=timeout). Connect corto descarta
+    # rápido los dominios muertos que aceptan TCP pero no responden.
+    to = (3, timeout)
 
-    for ruta in _RUTAS_CONTACTO:
+    for idx, ruta in enumerate(_RUTAS_CONTACTO):
         if visitadas >= max_paginas:
+            break
+        # Presupuesto de tiempo total agotado → salir ya
+        if time.monotonic() - inicio > tiempo_max:
             break
         pagina_url = urljoin(url, ruta) if ruta else url
         try:
-            r = requests.get(pagina_url, headers=HEADERS, timeout=timeout,
-                             allow_redirects=True)
+            r = requests.get(pagina_url, headers=HEADERS, timeout=to,
+                             allow_redirects=True, stream=True)
             if r.status_code != 200:
+                r.close()
                 continue
+
+            # Leer el contenido con límite de tamaño (1.5 MB) y de tiempo.
+            # Evita descargar webs gigantes o que envían datos byte a byte.
+            contenido = bytearray()
+            for chunk in r.iter_content(chunk_size=16384):
+                contenido += chunk
+                if len(contenido) > 1_500_000:          # 1.5 MB máx por página
+                    break
+                if time.monotonic() - inicio > tiempo_max:  # presupuesto agotado
+                    break
+            r.close()
             visitadas += 1
 
-            # Extraer emails del HTML completo
-            emails_encontrados += extraer_emails_de_html(r.text)
+            html = contenido.decode("utf-8", errors="ignore")
 
-            # También parsear con BeautifulSoup para mailto: en atributos href
-            soup = BeautifulSoup(r.text, "html.parser")
+            # Extraer emails del HTML completo
+            emails_encontrados += extraer_emails_de_html(html)
+
+            # Parsear con BeautifulSoup para mailto: en atributos href
+            soup = BeautifulSoup(html, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if href.lower().startswith("mailto:"):
@@ -197,7 +223,10 @@ def obtener_email_de_web_exhaustivo(url: str, max_paginas: int = 8,
                     break
 
         except Exception:
-            pass
+            # Si la HOME (primera ruta) no conecta, el dominio está muerto:
+            # no malgastar tiempo probando /contacto, /about, etc.
+            if idx == 0:
+                break
         if pausa > 0:
             time.sleep(pausa)
 
@@ -400,6 +429,64 @@ def buscar_indeed(terminos: List[str], ciudad: str, pais: str,
 
 # ── GOOGLE CUSTOM SEARCH API + DUCKDUCKGO FALLBACK ───────────────────────────
 
+def _dominio(url: str) -> str:
+    """Normaliza una URL a su dominio (sin www) para deduplicar."""
+    try:
+        net = urlparse(url).netloc.lower()
+        return net[4:] if net.startswith("www.") else net
+    except Exception:
+        return (url or "").lower()
+
+
+def _dedup_empresas(empresas: List[Dict]) -> List[Dict]:
+    """Elimina duplicados por dominio web; si no hay web, por nombre."""
+    vistos = set()
+    unicas = []
+    for emp in empresas:
+        web = (emp.get("web") or "").strip()
+        if web:
+            clave = _dominio(web)
+        else:
+            clave = "n:" + (emp.get("nombre") or "").strip().lower()
+        if not clave:
+            unicas.append(emp)          # sin clave fiable → conservar
+            continue
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        unicas.append(emp)
+    return unicas
+
+
+def _buscar_queries_serper(queries: List[str], serper_key: str,
+                           ciudad: str, pais: str, idioma: str,
+                           max_paginas: int = 3,
+                           max_workers: int = 4) -> List[Dict]:
+    """
+    Ejecuta varias queries de Serper EN PARALELO y devuelve los resultados
+    ya deduplicados por dominio. Es el núcleo eficiente de búsqueda usado
+    tanto por buscar_google() como por buscar_eures().
+    """
+    resultados: List[Dict] = []
+    workers = max(1, min(max_workers, len(queries)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futuros = {
+            executor.submit(_buscar_serper, q, serper_key,
+                            ciudad, pais, idioma, max_paginas): q
+            for q in queries
+        }
+        for fut in as_completed(futuros):
+            q = futuros[fut]
+            try:
+                nuevos = fut.result()
+                resultados += nuevos
+                logger.info(f"Serper [{q[:45]}...] → +{len(nuevos)} "
+                            f"(acum {len(resultados)})")
+            except Exception as e:
+                logger.warning(f"Serper [{q[:40]}]: {e}")
+    return _dedup_empresas(resultados)
+
+
 def _buscar_serper(query: str, serper_key: str,
                    ciudad: str, pais: str, idioma: str,
                    max_paginas: int = 1) -> List[Dict]:
@@ -490,31 +577,31 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
                   serper_key: str = "", max_paginas: int = 3) -> List[Dict]:
     """
     Búsqueda de empresas tech en una ciudad/país.
-    Prioridad: 1) Serper.dev  2) Google CSE  3) DuckDuckGo (fallback)
+    Prioridad: 1) Serper.dev (en PARALELO)  2) Google CSE  3) DuckDuckGo.
+    Las queries apuntan a webs de empresas (con email de contacto),
+    no a portales de empleo, para maximizar emails recopilables.
     """
-    queries = [
-        f'empresa software tecnologia "{ciudad}" contacto',
-        f'startup app desarrollo web "{ciudad}"',
-        f'agencia digital programacion "{ciudad}"',
-    ]
     if idioma == "en":
         queries = [
-            f'tech company software "{ciudad}" contact',
-            f'startup app development "{ciudad}"',
-            f'software agency "{ciudad}"',
+            f'software development company "{ciudad}" contact email',
+            f'web and app development agency "{ciudad}"',
+            f'tech startup "{ciudad}" careers',
+            f'IT software house "{ciudad}" "get in touch"',
+        ]
+    else:
+        queries = [
+            f'empresa desarrollo software "{ciudad}" contacto',
+            f'agencia desarrollo web y apps "{ciudad}"',
+            f'startup tecnológica "{ciudad}" "trabaja con nosotros"',
+            f'consultora IT software "{ciudad}" empleo',
         ]
 
-    resultados = []
-
-    # ── 1. Serper.dev (Google real, 2500/mes gratis, sin tarjeta) ─────────────
+    # ── 1. Serper.dev en PARALELO (Google real, 2500/mes gratis, sin tarjeta) ─
     if serper_key:
-        for query in queries:
-            nuevos = _buscar_serper(query, serper_key, ciudad, pais, idioma,
-                                    max_paginas=max_paginas)
-            resultados += nuevos
-            logger.info(f"Serper [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
-            time.sleep(0.5)
-        return resultados
+        return _buscar_queries_serper(queries, serper_key, ciudad, pais,
+                                      idioma, max_paginas)
+
+    resultados = []
 
     # ── 2. Google Custom Search API ───────────────────────────────────────────
     if api_key and cx:
@@ -523,7 +610,7 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
             resultados += nuevos
             logger.info(f"Google CSE [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
             time.sleep(1)
-        return resultados
+        return _dedup_empresas(resultados)
 
     # ── 3. DuckDuckGo HTML (fallback sin API key) ─────────────────────────────
     for query in queries:
@@ -556,7 +643,7 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
                             continue
                         href = a_tag.get("href", "")
                         if "uddg=" in href:
-                            from urllib.parse import unquote, urlparse, parse_qs
+                            from urllib.parse import unquote, parse_qs
                             qs = parse_qs(urlparse(href).query)
                             href = unquote(qs.get("uddg", [href])[0])
                         if not href.startswith("http"):
@@ -576,85 +663,75 @@ def buscar_google(terminos: List[str], ciudad: str, pais: str,
                 break
         time.sleep(4)
 
-    return resultados
-    queries = [
-        f'empresa software tecnologia "{ciudad}" contacto',
-        f'startup app desarrollo web "{ciudad}"',
-        f'agencia digital programacion "{ciudad}"',
-    ]
-    if idioma == "en":
-        queries = [
-            f'tech company software "{ciudad}" contact',
-            f'startup app development "{ciudad}"',
-            f'software agency "{ciudad}"',
-        ]
+    return _dedup_empresas(resultados)
 
-    resultados = []
 
-    # ── Modo API Google ────────────────────────────────────────────────────────
-    if api_key and cx:
-        for query in queries:
-            nuevos = _buscar_google_api(query, api_key, cx, ciudad, pais, idioma)
-            resultados += nuevos
-            logger.info(f"Google CSE [{query[:45]}...] → +{len(nuevos)} (total {len(resultados)})")
-            time.sleep(1)
-        return resultados
+# ── EURES (portal europeo de empleo, pan-europeo) ────────────────────────────
 
-    # ── Fallback: DuckDuckGo HTML ──────────────────────────────────────────────
-    for query in queries:
-        intentos = 0
-        max_intentos = 4
-        while intentos < max_intentos:
-            try:
-                r = requests.post(
-                    "https://html.duckduckgo.com/html/",
-                    data={"q": query, "kl": "es-es" if idioma == "es" else "en-us"},
-                    headers={**HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=15,
-                )
-                if r.status_code == 202:
-                    espera = 8 + intentos * 5
-                    logger.info(f"DuckDuckGo [{ciudad}]: HTTP 202, esperando {espera}s...")
-                    time.sleep(espera)
-                    intentos += 1
-                    continue
-                if r.status_code != 200:
-                    logger.warning(f"DuckDuckGo [{ciudad}]: HTTP {r.status_code}")
-                    break
+# Países cubiertos por EURES (UE + EEE + Suiza) con el idioma de búsqueda
+# preferente. Replicamos la cobertura del portal EURES buscando empleadores
+# tecnológicos país por país.
+EURES_PAISES = [
+    ("Spain", "es"),
+    ("Portugal", "en"),
+    ("France", "en"),
+    ("Germany", "en"),
+    ("Netherlands", "en"),
+    ("Ireland", "en"),
+    ("Belgium", "en"),
+    ("Italy", "en"),
+    ("Sweden", "en"),
+    ("Denmark", "en"),
+    ("Austria", "en"),
+    ("Poland", "en"),
+    ("Switzerland", "en"),
+    ("Norway", "en"),
+    ("Finland", "en"),
+    ("Luxembourg", "en"),
+]
 
-                soup = BeautifulSoup(r.text, "html.parser")
-                antes = len(resultados)
-                for result in soup.select(".result"):
-                    try:
-                        titulo  = result.select_one(".result__title")
-                        a_tag   = result.select_one("a.result__a")
-                        snippet = result.select_one(".result__snippet")
-                        if not titulo or not a_tag:
-                            continue
-                        href = a_tag.get("href", "")
-                        if "uddg=" in href:
-                            from urllib.parse import unquote, urlparse, parse_qs
-                            qs = parse_qs(urlparse(href).query)
-                            href = unquote(qs.get("uddg", [href])[0])
-                        if not href.startswith("http"):
-                            continue
-                        resultados.append(_empresa(
-                            nombre      = titulo.get_text(strip=True),
-                            descripcion = snippet.get_text(strip=True) if snippet else "",
-                            web=href, email="", fuente="DuckDuckGo",
-                            ciudad=ciudad, pais=pais, idioma=idioma,
-                        ))
-                    except Exception:
-                        pass
-                nuevos = len(resultados) - antes
-                logger.info(f"DuckDuckGo [{query[:45]}...] → +{nuevos} (total {len(resultados)})")
-                break
-            except Exception as e:
-                logger.warning(f"DuckDuckGo [{ciudad}]: {e}")
-                break
-        time.sleep(4)
 
-    return resultados
+def buscar_eures(serper_key: str = "",
+                 paises: Optional[List] = None,
+                 max_paginas: int = 2,
+                 max_workers: int = 4) -> List[Dict]:
+    """
+    Búsqueda estilo EURES (portal europeo de empleo) a nivel pan-europeo.
+
+    NOTA TÉCNICA: la API oficial de EURES (europa.eu/eures/api/jv-searchengine)
+    está protegida con Spring-Security CSRF + CAPTCHA y responde
+    'Access Denied' (403) a cualquier petición automatizada, por lo que no es
+    accesible sin credenciales de socio ni un navegador headless. Para cubrir
+    el MISMO mercado laboral (empresas tech de toda la UE/EEE) buscamos
+    empleadores tecnológicos por país con el motor que sí funciona (Serper).
+    Las empresas encontradas se etiquetan con fuente="EURES".
+    """
+    if not serper_key:
+        logger.warning("EURES: requiere serper_key (Serper.dev); se omite.")
+        return []
+
+    paises = paises or EURES_PAISES
+    resultados: List[Dict] = []
+
+    for pais, idioma in paises:
+        if idioma == "es":
+            queries = [
+                f'empresa desarrollo software {pais} empleo contacto',
+                f'startup tecnológica {pais} "trabaja con nosotros"',
+            ]
+        else:
+            queries = [
+                f'software development company {pais} careers contact',
+                f'tech startup IT company {pais} jobs hiring',
+            ]
+        nuevos = _buscar_queries_serper(queries, serper_key, pais, pais,
+                                        idioma, max_paginas, max_workers)
+        for emp in nuevos:
+            emp["fuente"] = "EURES"
+        resultados += nuevos
+        logger.info(f"🇪🇺 EURES [{pais}] → +{len(nuevos)} (total {len(resultados)})")
+
+    return _dedup_empresas(resultados)
 
 
 # ── GITHUB API (organizaciones tech por ubicación y lenguaje) ─────────────────

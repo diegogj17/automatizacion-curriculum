@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.expanduser("~/Library/Python/3.9/lib/python/site-pack
 from database     import Database
 from scraper      import (buscar_linkedin, buscar_tecnoempleo, buscar_infojobs,
                           buscar_indeed, buscar_google, buscar_github,
-                          enriquecer_con_emails,
+                          buscar_eures, enriquecer_con_emails,
                           obtener_email_de_web_exhaustivo, _elegir_mejor_email)
 from ai_filter    import filtrar_y_personalizar
 from email_sender import EmailSender
@@ -60,23 +60,18 @@ def _barra_progreso(actual: int, total: int, encontrados: int, ancho: int = 38):
     sys.stdout.flush()
 
 
-def _procesar_email_empresa(emp: dict, timeout_web: int = 30) -> tuple:
+def _procesar_email_empresa(emp: dict, tiempo_max: float = 25.0) -> tuple:
     """
     Worker concurrente: busca el email de una empresa (solo I/O de red).
     No toca la BD — devuelve el resultado para que lo guarde el hilo principal.
     Devuelve (emp, email_elegido_o_None, lista_completa).
 
-    timeout_web: segundos máximos totales para procesar UNA empresa entera.
-    Si se supera, se devuelve vacío y la empresa se marca como buscada.
+    tiempo_max: presupuesto total de segundos para esta empresa. La función
+    de scraping lo respeta internamente y nunca tarda más de ese tiempo.
     """
-    import signal
-
-    def _handler(signum, frame):
-        raise TimeoutError()
-
     try:
         emails = obtener_email_de_web_exhaustivo(
-            emp["web"], max_paginas=6, timeout=6, pausa=0.0
+            emp["web"], max_paginas=6, timeout=6, pausa=0.0, tiempo_max=tiempo_max
         )
         if emails:
             return (emp, _elegir_mejor_email(emails), emails)
@@ -138,21 +133,29 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
             print(f"\n🔄 Lote {num_lote}/{total_lotes}  "
                   f"(empresas {inicio+1}–{min(inicio+tam_lote, total)})")
 
-            emails_lote = []
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futuros = {executor.submit(_procesar_email_empresa, emp): emp
-                           for emp in lote}
-                hechos = 0
-                for futuro in as_completed(futuros):
+            emails_lote   = []
+            procesados_id = set()   # ids de empresas resueltas en este lote
+
+            # Tiempo máximo para el lote entero: en el peor caso el lote se
+            # procesa en (tam_lote / workers) tandas, cada una de timeout_empresa.
+            tandas         = (len(lote) + workers - 1) // workers
+            tiempo_max_lote = tandas * timeout_empresa + 10   # +10s de margen
+
+            executor = ThreadPoolExecutor(max_workers=workers)
+            futuros  = {executor.submit(_procesar_email_empresa, emp, timeout_empresa): emp
+                        for emp in lote}
+            hechos = 0
+            try:
+                # as_completed CON timeout global del lote: si algún worker se
+                # cuelga más allá de tiempo_max_lote, saltamos el resto del lote.
+                for futuro in as_completed(futuros, timeout=tiempo_max_lote):
                     emp = futuros[futuro]
                     hechos     += 1
                     procesadas += 1
+                    procesados_id.add(emp["id"])
 
                     try:
-                        _, elegido, todos = futuro.result(timeout=timeout_empresa)
-                    except FutureTimeout:
-                        logger.debug(f"⏱️  Timeout ({timeout_empresa}s): {emp.get('web','')}")
-                        elegido, todos = None, []
+                        _, elegido, todos = futuro.result(timeout=1)
                     except Exception:
                         elegido, todos = None, []
 
@@ -166,10 +169,28 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
                     else:
                         total_sin += 1
 
-                    # Marcar SIEMPRE como buscada (con o sin resultado, con o sin timeout)
                     db.marcar_empresa_buscada(emp["id"])
-
                     _barra_progreso(hechos, len(lote), total_emails)
+
+            except FutureTimeout:
+                # Uno o más workers colgados. No los esperamos.
+                print()  # salto de línea tras la barra
+                colgadas = len(lote) - len(procesados_id)
+                logger.warning(f"⏱️  {colgadas} web(s) colgadas en el lote {num_lote}, saltando…")
+
+            # Marcar como buscadas las que no se llegaron a procesar (colgadas)
+            for emp in lote:
+                if emp["id"] not in procesados_id:
+                    db.marcar_empresa_buscada(emp["id"])
+                    procesadas += 1
+                    total_sin  += 1
+
+            # Cerrar el executor SIN esperar a los threads colgados.
+            # cancel_futures cancela los que aún no habían empezado (Python 3.9+).
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)   # compat. <3.9
 
             # Resumen del lote
             print()  # salto tras la barra
@@ -313,6 +334,17 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
                                          idioma_email=idioma, token=github_token)
                     lote = _guardar_lote(lote, f"GitHub/{pais}")
                     todas_crudas += lote
+
+        # ── EURES (portal europeo de empleo, pan-europeo) ──────────────────────
+        if fuentes_cfg.get("eures"):
+            logger.info(f"\n{'─'*50}\n🇪🇺 EURES / Europa (UE + EEE + Suiza)\n{'─'*50}")
+            if serper_key:
+                eures_pags = config["filtros"].get("eures_paginas", 2)
+                lote = buscar_eures(serper_key=serper_key, max_paginas=eures_pags)
+                lote = _guardar_lote(lote, "EURES/Europa")
+                todas_crudas += lote
+            else:
+                logger.warning("EURES omitido: falta serper.api_key en config.yaml")
 
         logger.info(f"\n✅ Búsqueda completada. Total guardadas en BD: {total_guardadas}")
         empresas_crudas = todas_crudas
