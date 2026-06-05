@@ -441,8 +441,20 @@ if __name__ == "__main__":
 
     if args.estadisticas:
         db = Database(config["database"]["path"])
-        resumen = db.resumen()
-        print(f"\n📊 ESTADÍSTICAS:\n{resumen}\n")
+        r = db.resumen()
+        print(f"""
+{'='*60}
+📊  ESTADÍSTICAS DE LA BASE DE DATOS
+{'='*60}
+  🏢 Empresas en BD:            {r['total_empresas']:,}
+  📧 Emails recopilados:        {r['total_emails']:,}
+     └─ en empresas distintas:  {r['empresas_con_email']:,}
+  ✉️  Emails enviados (total):   {r['total_enviados']:,}
+     └─ hoy:                    {r['enviados_hoy']:,}
+  ⏳ Emails pendientes:         {r['emails_pendientes']:,}
+  ❌ Errores de envío:          {r['errores']:,}
+{'='*60}
+""")
         sys.exit(0)
 
     if args.buscar_emails:

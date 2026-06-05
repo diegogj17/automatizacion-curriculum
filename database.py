@@ -65,6 +65,8 @@ class Database:
                     empresa_id  INTEGER REFERENCES empresas(id),
                     email       TEXT NOT NULL UNIQUE,
                     principal   INTEGER DEFAULT 0,   -- 1 = email preferido (rrhh/empleo…)
+                    enviado     INTEGER DEFAULT 0,   -- 1 = ya se le envió el CV
+                    fecha_envio TEXT,                -- fecha/hora del envío (NULL si no enviado)
                     fecha_add   TEXT DEFAULT (datetime('now'))
                 );
 
@@ -116,6 +118,27 @@ class Database:
                         ON empresas(web) WHERE web IS NOT NULL AND web != '';
                 """)
                 logger.info("Migración completada.")
+
+        # Migración: columnas 'enviado' y 'fecha_envio' en emails_empresa (BD antiguas)
+        with self._conectar() as conn:
+            cols_em = {row[1] for row in conn.execute("PRAGMA table_info(emails_empresa)")}
+            if "enviado" not in cols_em:
+                conn.execute("ALTER TABLE emails_empresa ADD COLUMN enviado INTEGER DEFAULT 0")
+            if "fecha_envio" not in cols_em:
+                conn.execute("ALTER TABLE emails_empresa ADD COLUMN fecha_envio TEXT")
+            # Marcar como enviados los emails que ya estén en emails_enviados
+            conn.execute("""
+                UPDATE emails_empresa
+                SET enviado = 1,
+                    fecha_envio = (
+                        SELECT MAX(ev.fecha_envio) FROM emails_enviados ev
+                        WHERE ev.email_destino = emails_empresa.email
+                          AND ev.estado = 'enviado'
+                    )
+                WHERE email IN (
+                    SELECT email_destino FROM emails_enviados WHERE estado = 'enviado'
+                )
+            """)
 
         # Migración: volcar emails que estaban en empresas.email a emails_empresa
         with self._conectar() as conn:
@@ -224,8 +247,8 @@ class Database:
     def obtener_destinos_pendientes(self) -> List[Dict]:
         """
         Devuelve TODOS los emails pendientes de contactar (uno por fila),
-        con los datos de su empresa. Un email se considera pendiente si no
-        aparece en emails_enviados. Ordenados por relevancia de la empresa.
+        con los datos de su empresa. Un email es pendiente si enviado = 0.
+        Ordenados por relevancia de la empresa y email principal primero.
         Cada dict incluye: id (empresa), nombre, web, idioma, relevancia,
         ciudad, pais, descripcion y 'email' (el destino concreto).
         """
@@ -236,7 +259,7 @@ class Database:
                        e.pais, e.idioma, e.relevancia, em.email AS email
                 FROM emails_empresa em
                 JOIN empresas e ON e.id = em.empresa_id
-                WHERE em.email NOT IN (SELECT email_destino FROM emails_enviados)
+                WHERE em.enviado = 0
                 ORDER BY e.relevancia DESC, em.principal DESC, e.fecha_add ASC
             """).fetchall()
             return [dict(r) for r in rows]
@@ -259,6 +282,14 @@ class Database:
                    VALUES (?, ?, ?, ?, ?)""",
                 (empresa_id, email_destino, asunto, cuerpo, estado)
             )
+            # Marcar el email como enviado en emails_empresa (solo si fue OK)
+            if estado == "enviado":
+                conn.execute(
+                    """UPDATE emails_empresa
+                       SET enviado = 1, fecha_envio = datetime('now')
+                       WHERE email = ?""",
+                    (email_destino,)
+                )
         logger.info(f"Envío registrado → {email_destino} [{estado}]")
 
     def emails_enviados_hoy(self) -> int:
@@ -283,10 +314,9 @@ class Database:
             errores        = conn.execute(
                 "SELECT COUNT(*) FROM emails_enviados WHERE estado = 'error'"
             ).fetchone()[0]
-            pendientes = conn.execute("""
-                SELECT COUNT(*) FROM emails_empresa
-                WHERE email NOT IN (SELECT email_destino FROM emails_enviados)
-            """).fetchone()[0]
+            pendientes = conn.execute(
+                "SELECT COUNT(*) FROM emails_empresa WHERE enviado = 0"
+            ).fetchone()[0]
             return {
                 "total_empresas":     total_empresas,
                 "total_emails":       total_emails,
