@@ -501,6 +501,88 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
 """)
 
 
+def _enviar_email_prueba(config: dict):
+    """
+    Genera un email de candidatura real (con Ollama) usando una empresa ficticia
+    y lo envía a TU PROPIO CORREO para que veas exactamente cómo quedará.
+    No registra nada en la BD.
+    """
+    logger = logging.getLogger(__name__)
+    destinatario = config["personal"]["email_remitente"]
+
+    print("\n" + "=" * 60)
+    print("✉️   EMAIL DE PRUEBA")
+    print("=" * 60)
+    print(f"  Destino:  {destinatario}  (tu propio correo)")
+    print(f"  Modelo:   {config['ollama']['model']}")
+    print("=" * 60)
+
+    # Empresa ficticia con tecnologías que el candidato usa → email más rico
+    empresa_ficticia = {
+        "nombre":      "Tecnosur Digital S.L.",
+        "descripcion": "Agencia de desarrollo de apps móviles y web en Sevilla. "
+                       "Trabajan con Flutter, Firebase y React para startups.",
+        "ciudad":      "Sevilla",
+        "pais":        "España",
+        "idioma":      "es",
+        "fuente":      "Prueba",
+        "web":         "",
+        "tecnologias": "Flutter, Firebase, React",   # ← coincide con el candidato
+    }
+
+    print("\n⏳ Generando email con Ollama...")
+    try:
+        email_data = generar_email_personalizado(
+            empresa_ficticia,
+            config["personal"],
+            config["skills"],
+            config["ollama"]["model"],
+        )
+    except Exception as e:
+        print(f"❌ Error generando email con Ollama: {e}")
+        return
+
+    asunto = email_data["asunto"]
+    cuerpo = email_data["cuerpo"]
+    cv_path = email_data.get("cv_path") or config["personal"].get("cv_path", "")
+
+    print("\n" + "─" * 60)
+    print(f"📌 ASUNTO:\n   {asunto}")
+    print("─" * 60)
+    print(f"📄 CUERPO:\n")
+    for linea in cuerpo.splitlines():
+        print(f"   {linea}")
+    print("─" * 60)
+
+    print(f"\n📎 CV adjunto: {cv_path}")
+    print(f"\n¿Enviar este email a {destinatario}? [s/N] ", end="", flush=True)
+    try:
+        respuesta = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        respuesta = "n"
+
+    if respuesta != "s":
+        print("❌ Envío cancelado.")
+        return
+
+    print(f"\n📤 Enviando a {destinatario}...")
+    sender = EmailSender(config)
+    ok = sender.enviar(
+        destinatario = destinatario,
+        asunto       = f"[PRUEBA] {asunto}",
+        cuerpo       = (f"⚠️  Este es un email de PRUEBA generado automáticamente.\n"
+                        f"Destino real sería: RRHH de {empresa_ficticia['nombre']}\n"
+                        f"{'─'*50}\n\n{cuerpo}"),
+        cv_path      = cv_path,
+    )
+
+    if ok:
+        print(f"\n✅ Email de prueba enviado a {destinatario}")
+        print("   Revisa tu bandeja de entrada (o spam).")
+    else:
+        print(f"\n❌ Error enviando. Comprueba la conexión con --test-smtp")
+
+
 def _email_generico(config: dict) -> str:
     """Email de candidatura genérico como fallback."""
     p = config["personal"]
@@ -532,6 +614,7 @@ if __name__ == "__main__":
     parser.add_argument("--solo-enviar",   action="store_true",   help="Solo envía emails (usa empresas ya en BD)")
     parser.add_argument("--buscar-emails", action="store_true",   help="Busca emails exhaustivamente en empresas de la BD sin email")
     parser.add_argument("--test-smtp",     action="store_true",   help="Prueba la conexión de correo")
+    parser.add_argument("--email-prueba",  action="store_true",   help="Genera y envía un email de prueba a tu propio correo")
     parser.add_argument("--estadisticas",  action="store_true",   help="Muestra estadísticas de la BD")
     args = parser.parse_args()
 
@@ -562,6 +645,10 @@ if __name__ == "__main__":
 
     if args.buscar_emails:
         buscar_emails_bd(config)
+        sys.exit(0)
+
+    if args.email_prueba:
+        _enviar_email_prueba(config)
         sys.exit(0)
 
     ejecutar_pipeline(

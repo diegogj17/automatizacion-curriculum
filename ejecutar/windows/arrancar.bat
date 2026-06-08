@@ -39,8 +39,9 @@ echo   3) Solo enviar emails (empresas ya en BD)
 echo   4) Buscar emails en empresas de la BD (búsqueda exhaustiva)
 echo   5) Ver estadísticas
 echo   6) Probar conexión de email
+echo   7) Enviar email de PRUEBA a tu propio correo
 echo.
-set /p opcion="Elige una opción (1-6): "
+set /p opcion="Elige una opción (1-7): "
 
 if "%opcion%"=="1" (
     echo.
@@ -64,6 +65,10 @@ if "%opcion%"=="1" (
 ) else if "%opcion%"=="6" (
     echo.
     python main.py --test-smtp
+) else if "%opcion%"=="7" (
+    echo.
+    echo ✉️  Generando email de prueba con Ollama y enviándolo a tu correo...
+    python main.py --email-prueba
 ) else (
     echo Opción no válida.
 )

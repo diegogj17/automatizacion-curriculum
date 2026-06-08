@@ -34,8 +34,9 @@ echo "  3) Solo enviar emails (empresas ya en BD)"
 echo "  4) Buscar emails en empresas de la BD (búsqueda exhaustiva)"
 echo "  5) Ver estadísticas"
 echo "  6) Probar conexión de email"
+echo "  7) Enviar email de PRUEBA a tu propio correo"
 echo ""
-read "opcion?Elige una opción (1-6): "
+read "opcion?Elige una opción (1-7): "
 
 case $opcion in
     1)
@@ -66,6 +67,11 @@ case $opcion in
     6)
         echo ""
         $PYTHON main.py --test-smtp
+        ;;
+    7)
+        echo ""
+        echo "✉️  Generando email de prueba con Ollama y enviándolo a tu correo..."
+        $PYTHON main.py --email-prueba
         ;;
     *)
         echo "Opción no válida."
