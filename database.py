@@ -149,6 +149,9 @@ class Database:
                 conn.execute("ALTER TABLE empresas ADD COLUMN email_buscado INTEGER DEFAULT 0")
             if "fecha_busqueda_email" not in cols_emp:
                 conn.execute("ALTER TABLE empresas ADD COLUMN fecha_busqueda_email TEXT")
+            # tecnologias: stack detectado en la web (CSV) para personalizar emails
+            if "tecnologias" not in cols_emp:
+                conn.execute("ALTER TABLE empresas ADD COLUMN tecnologias TEXT")
             # Las que ya tienen email en emails_empresa → marcarlas como buscadas
             conn.execute("""
                 UPDATE empresas SET email_buscado = 1
@@ -226,6 +229,15 @@ class Database:
                 (empresa_id,)
             )
 
+    def guardar_tecnologias(self, empresa_id: int, tecnologias: List[str]):
+        """Guarda el stack tecnológico detectado en la web (lista → CSV)."""
+        valor = ", ".join(tecnologias) if tecnologias else ""
+        with self._conectar() as conn:
+            conn.execute(
+                "UPDATE empresas SET tecnologias = ? WHERE id = ?",
+                (valor, empresa_id)
+            )
+
     def agregar_emails_empresa(self, empresa_id: int, emails: List[str],
                                principal: Optional[str] = None) -> int:
         """
@@ -282,7 +294,8 @@ class Database:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("""
                 SELECT e.id, e.nombre, e.web, e.descripcion, e.ciudad,
-                       e.pais, e.idioma, e.relevancia, em.email AS email
+                       e.pais, e.idioma, e.relevancia, e.tecnologias, e.fuente,
+                       em.email AS email
                 FROM emails_empresa em
                 JOIN empresas e ON e.id = em.empresa_id
                 WHERE em.enviado = 0

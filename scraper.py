@@ -243,6 +243,132 @@ def get_soup(url: str) -> Optional[BeautifulSoup]:
         return None
 
 
+# ── DETECCIÓN DE TECNOLOGÍAS (fingerprinting de la web de la empresa) ─────────
+
+# Cada tecnología → lista de firmas a buscar en el HTML (minúsculas) o headers.
+# Orientado a detectar el stack que el candidato domina + frameworks comunes.
+# Si una firma aparece, se considera que la empresa usa esa tecnología.
+_TECH_FINGERPRINTS = {
+    # Frameworks frontend
+    "React":        ["data-reactroot", "react-dom", "/react.", "__reactcontainer",
+                     "_reactlisting", "react.production"],
+    "Next.js":      ["/_next/static", "__next_data__", "__next\"", "next/dist"],
+    "Vue":          ["vue.runtime", "__vue__", "data-v-", "/vue.", "vue.js"],
+    "Nuxt":         ["__nuxt__", "/_nuxt/"],
+    "Angular":      ["ng-version", "ng-app", "angular.js", "/angular."],
+    "Astro":        ["/_astro/", "astro-island", 'content="astro'],
+    "Svelte":       ["__svelte", "svelte-", "/svelte"],
+    "Gatsby":       ["___gatsby", "/page-data/", "gatsby-"],
+    # CMS / builders
+    "WordPress":    ["wp-content", "wp-includes", 'content="wordpress'],
+    "Wix":          ["static.wixstatic", "_wix", "wix.com"],
+    "Webflow":      ['content="webflow', "webflow.js", ".webflow."],
+    "Shopify":      ["cdn.shopify", "shopify.com", "myshopify"],
+    "Squarespace":  ["squarespace.com", "static1.squarespace"],
+    "Drupal":       ["/sites/default/files", "drupal.js", 'content="drupal'],
+    "Joomla":       ["/media/jui/", 'content="joomla'],
+    # Backend / lenguajes (por headers o pistas)
+    "PHP":          ["php"],            # solo por header x-powered-by
+    "Laravel":      ["laravel_session", "/vendor/laravel"],
+    "Node.js":      ["express"],        # solo por header x-powered-by
+    "ASP.NET":      ["asp.net", "__viewstate"],
+    "Django":       ["csrfmiddlewaretoken", "__admin_media_prefix__"],
+    "Ruby on Rails": ["csrf-param", "rails", "/assets/application-"],
+    # Mobile / BaaS — ¡los que más le interesan al candidato!
+    "Flutter":      ["main.dart.js", "flutter_service_worker", "flutter.js",
+                     "_flutter"],
+    "Firebase":     ["firebaseapp.com", "firebaseio.com", "gstatic.com/firebasejs",
+                     "firebase.js", "/firebase/"],
+    "Supabase":     ["supabase.co", "supabase.com", "/supabase"],
+    # Librerías / estilos
+    "jQuery":       ["jquery.min.js", "/jquery-", "jquery.js"],
+    "Bootstrap":    ["bootstrap.min.css", "bootstrap.bundle", "/bootstrap."],
+    "Tailwind CSS": ["tailwind", "tailwindcss"],
+    "TypeScript":   [".ts\"", "typescript"],   # rara vez visible en producción
+}
+
+# Tecnologías que IMPLICAN otras (para casar con las skills del candidato).
+# p.ej. Next.js implica que usan React + JavaScript, Nuxt implica Vue, etc.
+_TECH_IMPLICA = {
+    "Next.js": ["React", "JavaScript"],
+    "Gatsby":  ["React", "JavaScript"],
+    "Nuxt":    ["Vue", "JavaScript"],
+    "React":   ["JavaScript"],
+    "Vue":     ["JavaScript"],
+    "Angular": ["TypeScript", "JavaScript"],
+    "Svelte":  ["JavaScript"],
+    "Astro":   ["JavaScript"],
+    "Flutter": ["Dart"],
+    "Laravel": ["PHP"],
+}
+
+
+def detectar_tecnologias(url: str, timeout: int = 8,
+                         tiempo_max: float = 12.0) -> List[str]:
+    """
+    Visita la web de la empresa y detecta qué tecnologías usa, comparando
+    su HTML y cabeceras HTTP contra _TECH_FINGERPRINTS.
+
+    Devuelve una lista canónica de tecnologías detectadas (sin duplicados),
+    p.ej. ["React", "Firebase", "Tailwind CSS"]. Lista vacía si no detecta
+    nada o la web no responde. Nunca lanza excepción ni se queda pillado
+    (tiene presupuesto de tiempo total).
+    """
+    if not url or not url.startswith("http"):
+        return []
+
+    inicio = time.monotonic()
+    detectadas: set = set()
+    to = (3, timeout)
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=to,
+                         allow_redirects=True, stream=True)
+        # Cabeceras (detecta backend aunque el HTML no lo revele)
+        powered = (r.headers.get("X-Powered-By", "") + " " +
+                   r.headers.get("Server", "")).lower()
+        if "php" in powered:
+            detectadas.add("PHP")
+        if "express" in powered:
+            detectadas.add("Node.js")
+        if "asp.net" in powered:
+            detectadas.add("ASP.NET")
+        if "nginx" in powered or "apache" in powered:
+            pass  # servidor web, no es un framework relevante
+
+        if r.status_code != 200:
+            r.close()
+            return sorted(detectadas)
+
+        # Leer HTML con límite de tamaño y tiempo
+        contenido = bytearray()
+        for chunk in r.iter_content(chunk_size=16384):
+            contenido += chunk
+            if len(contenido) > 1_200_000:
+                break
+            if time.monotonic() - inicio > tiempo_max:
+                break
+        r.close()
+        html = contenido.decode("utf-8", errors="ignore").lower()
+
+        for tech, firmas in _TECH_FINGERPRINTS.items():
+            # PHP/Node.js solo se fían del header (firmas genéricas)
+            if tech in ("PHP", "Node.js"):
+                continue
+            if any(firma in html for firma in firmas):
+                detectadas.add(tech)
+
+        # Expandir tecnologías implícitas (Next.js → React + JavaScript, etc.)
+        for tech in list(detectadas):
+            for implicada in _TECH_IMPLICA.get(tech, []):
+                detectadas.add(implicada)
+
+    except Exception:
+        return sorted(detectadas)
+
+    return sorted(detectadas)
+
+
 def _empresa(nombre, descripcion, web, email, fuente, ciudad, pais, idioma="es") -> Dict:
     return {
         "nombre": nombre, "descripcion": descripcion, "web": web,

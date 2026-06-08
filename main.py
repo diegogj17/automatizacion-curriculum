@@ -19,8 +19,9 @@ from database     import Database
 from scraper      import (buscar_linkedin, buscar_tecnoempleo, buscar_infojobs,
                           buscar_indeed, buscar_google, buscar_github,
                           buscar_eures, enriquecer_con_emails,
-                          obtener_email_de_web_exhaustivo, _elegir_mejor_email)
-from ai_filter    import filtrar_y_personalizar
+                          obtener_email_de_web_exhaustivo, _elegir_mejor_email,
+                          detectar_tecnologias)
+from ai_filter    import filtrar_y_personalizar, generar_email_personalizado
 from email_sender import EmailSender
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
@@ -61,11 +62,13 @@ def _barra_progreso(actual: int, total: int, encontrados: int, ancho: int = 38):
     sys.stdout.flush()
 
 
-def _procesar_email_empresa(emp: dict, tiempo_max: float = 25.0) -> tuple:
+def _procesar_email_empresa(emp: dict, tiempo_max: float = 25.0,
+                            detectar_tech: bool = True) -> tuple:
     """
-    Worker concurrente: busca el email de una empresa (solo I/O de red).
+    Worker concurrente: busca el email de una empresa (solo I/O de red) y,
+    opcionalmente, detecta su stack tecnológico aprovechando la misma visita.
     No toca la BD — devuelve el resultado para que lo guarde el hilo principal.
-    Devuelve (emp, email_elegido_o_None, lista_completa).
+    Devuelve (emp, email_elegido_o_None, lista_completa, tecnologias).
 
     tiempo_max: presupuesto total de segundos para esta empresa. La función
     de scraping lo respeta internamente y nunca tarda más de ese tiempo.
@@ -74,11 +77,16 @@ def _procesar_email_empresa(emp: dict, tiempo_max: float = 25.0) -> tuple:
         emails = obtener_email_de_web_exhaustivo(
             emp["web"], max_paginas=6, timeout=6, pausa=0.0, tiempo_max=tiempo_max
         )
-        if emails:
-            return (emp, _elegir_mejor_email(emails), emails)
-        return (emp, None, [])
+        techs = []
+        if detectar_tech:
+            try:
+                techs = detectar_tecnologias(emp["web"], timeout=5, tiempo_max=8)
+            except Exception:
+                techs = []
+        elegido = _elegir_mejor_email(emails) if emails else None
+        return (emp, elegido, emails or [], techs)
     except Exception:
-        return (emp, None, [])
+        return (emp, None, [], [])
 
 
 def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
@@ -100,6 +108,7 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
     workers         = em_cfg.get("workers",          workers)
     tam_lote        = em_cfg.get("tam_lote",          tam_lote)
     timeout_empresa = em_cfg.get("timeout_empresa",   45)   # seg. máx. por empresa
+    detectar_tech   = config.get("email", {}).get("detectar_tecnologias", True)
 
     empresas = db.obtener_empresas_sin_email()
     total = len(empresas)
@@ -143,7 +152,7 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
             tiempo_max_lote = tandas * timeout_empresa + 10   # +10s de margen
 
             executor = ThreadPoolExecutor(max_workers=workers)
-            futuros  = {executor.submit(_procesar_email_empresa, emp, timeout_empresa): emp
+            futuros  = {executor.submit(_procesar_email_empresa, emp, timeout_empresa, detectar_tech): emp
                         for emp in lote}
             hechos = 0
             try:
@@ -156,9 +165,13 @@ def buscar_emails_bd(config: dict, workers: int = 8, tam_lote: int = 40):
                     procesados_id.add(emp["id"])
 
                     try:
-                        _, elegido, todos = futuro.result(timeout=1)
+                        _, elegido, todos, techs = futuro.result(timeout=1)
                     except Exception:
-                        elegido, todos = None, []
+                        elegido, todos, techs = None, [], []
+
+                    # Guardar tecnologías detectadas (aunque no haya email)
+                    if techs:
+                        db.guardar_tecnologias(emp["id"], techs)
 
                     if elegido and todos:
                         nuevos = db.agregar_emails_empresa(emp["id"], todos, principal=elegido)
@@ -400,6 +413,11 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
     logger.info(f"Emails pendientes de contactar: {len(pendientes)} "
                 f"(se envía a todos los correos de cada empresa)")
 
+    personal    = config["personal"]
+    skills      = config["skills"]
+    model       = config["ollama"]["model"]
+    detectar_tech = config["email"].get("detectar_tecnologias", True)
+
     enviados = 0
     errores  = 0
 
@@ -411,11 +429,37 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         if not emp.get("email"):
             continue
 
-        asunto = emp.get("asunto") or (
-            f"Candidatura espontánea – Desarrollador {config['skills']['nivel']} "
-            f"| {config['personal']['nombre']}"
-        )
-        cuerpo = emp.get("cuerpo_email") or _email_generico(config)
+        # ── INVESTIGAR LA EMPRESA: detectar su stack tecnológico ──────────────
+        # Si aún no se ha detectado y tiene web, visitamos la web para ver qué
+        # tecnologías usa. Así el email mencionará las que el candidato comparte.
+        if detectar_tech and not emp.get("tecnologias") and emp.get("web"):
+            try:
+                techs = detectar_tecnologias(emp["web"])
+                emp["tecnologias"] = ", ".join(techs)
+                db.guardar_tecnologias(emp["id"], techs)
+                if techs:
+                    logger.info(f"   🔎 Tecnologías detectadas en {emp['nombre']}: "
+                                f"{emp['tecnologias']}")
+            except Exception as e:
+                logger.debug(f"No se pudieron detectar tecnologías de {emp['nombre']}: {e}")
+
+        # ── GENERAR EL EMAIL PERSONALIZADO AL VUELO (usa las tecnologías) ─────
+        # Se genera aquí (no en FASE 2) para que funcione también con --solo-enviar
+        # y para incorporar el stack tecnológico recién detectado.
+        try:
+            email_data = generar_email_personalizado(emp, personal, skills, model)
+            asunto = email_data["asunto"]
+            cuerpo = email_data["cuerpo"]
+            cv_path = email_data.get("cv_path") or emp.get("cv_path")
+        except Exception as e:
+            logger.warning(f"Fallo generando email para {emp['nombre']}: {e}. Usando genérico.")
+            asunto = (f"Candidatura espontánea – Desarrollador {skills['nivel']} "
+                      f"| {personal['nombre']}")
+            cuerpo = _email_generico(config)
+            cv_path = emp.get("cv_path")
+
+        if not cuerpo.strip():
+            cuerpo = _email_generico(config)
 
         # Mostrar preview
         logger.info(f"\n{'─'*50}")
@@ -424,7 +468,7 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
         logger.info(f"   Preview: {cuerpo[:120]}...")
 
         ok = sender.enviar_con_pausa(emp["email"], asunto, cuerpo,
-                                     cv_path=emp.get("cv_path"))
+                                     cv_path=cv_path)
         estado = "enviado" if ok else "error"
 
         db.registrar_envio(

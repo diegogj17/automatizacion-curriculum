@@ -31,6 +31,57 @@ def _llamar_ollama(prompt: str, model: str = "mistral:latest",
         return ""
 
 
+def _tech_coincidentes(empresa_tecnologias, skills: dict) -> list:
+    """
+    Calcula qué tecnologías de la EMPRESA coinciden con las que domina el
+    CANDIDATO. Devuelve la lista de coincidencias (nombres tal y como los
+    tiene el candidato), p.ej. ["React", "Firebase"].
+
+    'empresa_tecnologias' puede ser una lista o un string CSV ("React, Firebase").
+    """
+    if not empresa_tecnologias:
+        return []
+    if isinstance(empresa_tecnologias, str):
+        empresa_tech = [t.strip() for t in empresa_tecnologias.split(",") if t.strip()]
+    else:
+        empresa_tech = list(empresa_tecnologias)
+
+    # Expandir tecnologías implícitas (Next.js → React, Flutter → Dart, …) para
+    # que el matching sea robusto aunque se guardaran sin expandir. Fuente única
+    # de verdad: scraper._TECH_IMPLICA.
+    try:
+        from scraper import _TECH_IMPLICA
+        expandida = list(empresa_tech)
+        for tech in empresa_tech:
+            expandida += _TECH_IMPLICA.get(tech, [])
+        empresa_tech = expandida
+    except Exception:
+        pass
+
+    # Skills del candidato (principales + secundarias), normalizadas
+    skills_candidato = list(skills.get("principales", [])) + list(skills.get("secundarias", []))
+
+    # Expandir "HTML/CSS" en sus componentes para casar mejor
+    expandidas = {}
+    for s in skills_candidato:
+        clave = s.lower().strip()
+        expandidas[clave] = s
+        if "/" in clave:                       # "html/css" → "html", "css"
+            for parte in clave.split("/"):
+                expandidas[parte.strip()] = s
+
+    coincidencias = []
+    vistos = set()
+    for tech in empresa_tech:
+        clave = tech.lower().strip()
+        if clave in expandidas:
+            nombre = expandidas[clave]
+            if nombre not in vistos:
+                coincidencias.append(nombre)
+                vistos.add(nombre)
+    return coincidencias
+
+
 def analizar_relevancia(empresa: dict, skills: dict, model: str) -> int:
     """
     Pide a Ollama que puntúe del 0-10 si la empresa es relevante
@@ -73,6 +124,30 @@ def generar_email_personalizado(empresa: dict, personal: dict, skills: dict,
     """
     idioma = empresa.get('idioma', 'es')
 
+    # ── Tecnologías de la empresa que coinciden con las del candidato ──────────
+    empresa_tech = empresa.get('tecnologias', '')
+    coincidencias = _tech_coincidentes(empresa_tech, skills)
+    bloque_tech_es = ""
+    bloque_tech_en = ""
+    if coincidencias:
+        lista = ", ".join(coincidencias)
+        bloque_tech_es = (
+            f"\n\nTECNOLOGÍAS DETECTADAS EN LA WEB DE LA EMPRESA QUE EL CANDIDATO "
+            f"TAMBIÉN DOMINA: {lista}.\n"
+            f"IMPORTANTE: menciona de forma NATURAL y específica que has visto que "
+            f"trabajan con {lista} y que el candidato tiene experiencia con esas mismas "
+            f"tecnologías. Esto demuestra que has investigado la empresa. No lo fuerces "
+            f"ni lo pongas como una lista; intégralo en una frase fluida."
+        )
+        bloque_tech_en = (
+            f"\n\nTECHNOLOGIES DETECTED ON THE COMPANY'S WEBSITE THAT THE CANDIDATE "
+            f"ALSO MASTERS: {lista}.\n"
+            f"IMPORTANT: naturally and specifically mention that you noticed they work "
+            f"with {lista} and that the candidate has hands-on experience with those same "
+            f"technologies. This shows you researched the company. Don't force it or make "
+            f"it a list; weave it into a fluent sentence."
+        )
+
     # Extraer proyectos destacados si existen
     proyectos = skills.get('proyectos_destacados', [])
     proyecto_str_en = ""
@@ -105,7 +180,7 @@ TARGET COMPANY:
 - Description/Position found: {empresa['descripcion']}
 - City: {empresa.get('ciudad', 'Ireland')}
 - Country: {empresa.get('pais', '')}
-- Source: {empresa['fuente']}
+- Source: {empresa['fuente']}{bloque_tech_en}
 
 INSTRUCTIONS:
 1. Start with a professional greeting to the HR/Hiring team
@@ -134,7 +209,7 @@ EMPRESA DESTINATARIA:
 - Nombre: {empresa['nombre']}
 - Descripción/Puesto visto: {empresa['descripcion']}
 - Ciudad: {empresa.get('ciudad', 'España')}
-- Fuente donde se encontró: {empresa['fuente']}
+- Fuente donde se encontró: {empresa['fuente']}{bloque_tech_es}
 
 INSTRUCCIONES:
 1. Empieza con un saludo profesional al departamento de RRHH
