@@ -46,7 +46,7 @@ ollama:
 email:
   metodo: "gmail"              # gmail (recomendado) u outlook
   asunto_template: "Candidatura espontánea - Desarrollador {nivel} | {nombre}"
-  max_emails_por_dia: 20
+  max_emails_por_dia: 0    # 0 = sin límite (envía todo hasta Ctrl+C); número = límite diario máximo
   espera_entre_emails: 30
   detectar_tecnologias: true   # investiga la web de cada empresa y menciona en el email las tecnologías que compartís
 

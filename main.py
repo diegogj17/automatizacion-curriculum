@@ -402,87 +402,93 @@ def ejecutar_pipeline(config: dict, solo_buscar: bool = False,
     logger.info("FASE 3: Enviando emails a empresas pendientes...")
     logger.info("=" * 60)
 
-    max_hoy    = config["email"]["max_emails_por_dia"]
+    max_hoy    = config["email"]["max_emails_por_dia"]   # 0 = sin límite
     enviados_h = db.emails_enviados_hoy()
+    sin_limite = (max_hoy == 0)
 
-    if enviados_h >= max_hoy:
+    if not sin_limite and enviados_h >= max_hoy:
         logger.warning(f"⚠️  Límite diario alcanzado ({max_hoy} emails). Vuelve mañana.")
         return
 
     pendientes = db.obtener_destinos_pendientes()
-    logger.info(f"Emails pendientes de contactar: {len(pendientes)} "
-                f"(se envía a todos los correos de cada empresa)")
+    if sin_limite:
+        logger.info(f"Emails pendientes: {len(pendientes)} — sin límite diario, "
+                    f"para con Ctrl+C cuando quieras.")
+    else:
+        logger.info(f"Emails pendientes: {len(pendientes)} "
+                    f"(límite hoy: {max_hoy - enviados_h} restantes)")
 
-    personal    = config["personal"]
-    skills      = config["skills"]
-    model       = config["ollama"]["model"]
+    personal      = config["personal"]
+    skills        = config["skills"]
+    model         = config["ollama"]["model"]
     detectar_tech = config["email"].get("detectar_tecnologias", True)
 
     enviados = 0
     errores  = 0
 
-    for emp in pendientes:
-        if enviados_h + enviados >= max_hoy:
-            logger.warning(f"⚠️  Límite diario alcanzado ({max_hoy}). Parando.")
-            break
+    try:
+        for emp in pendientes:
+            if not sin_limite and enviados_h + enviados >= max_hoy:
+                logger.warning(f"⚠️  Límite diario alcanzado ({max_hoy}). Parando.")
+                break
 
-        if not emp.get("email"):
-            continue
+            if not emp.get("email"):
+                continue
 
-        # ── INVESTIGAR LA EMPRESA: detectar su stack tecnológico ──────────────
-        # Si aún no se ha detectado y tiene web, visitamos la web para ver qué
-        # tecnologías usa. Así el email mencionará las que el candidato comparte.
-        if detectar_tech and not emp.get("tecnologias") and emp.get("web"):
+            # ── INVESTIGAR LA EMPRESA: detectar su stack tecnológico ──────────
+            if detectar_tech and not emp.get("tecnologias") and emp.get("web"):
+                try:
+                    techs = detectar_tecnologias(emp["web"])
+                    emp["tecnologias"] = ", ".join(techs)
+                    db.guardar_tecnologias(emp["id"], techs)
+                    if techs:
+                        logger.info(f"   🔎 Tecnologías detectadas en {emp['nombre']}: "
+                                    f"{emp['tecnologias']}")
+                except Exception as e:
+                    logger.debug(f"No se pudieron detectar tecnologías de {emp['nombre']}: {e}")
+
+            # ── GENERAR EL EMAIL PERSONALIZADO AL VUELO ───────────────────────
             try:
-                techs = detectar_tecnologias(emp["web"])
-                emp["tecnologias"] = ", ".join(techs)
-                db.guardar_tecnologias(emp["id"], techs)
-                if techs:
-                    logger.info(f"   🔎 Tecnologías detectadas en {emp['nombre']}: "
-                                f"{emp['tecnologias']}")
+                email_data = generar_email_personalizado(emp, personal, skills, model)
+                asunto  = email_data["asunto"]
+                cuerpo  = email_data["cuerpo"]
+                cv_path = email_data.get("cv_path") or emp.get("cv_path")
             except Exception as e:
-                logger.debug(f"No se pudieron detectar tecnologías de {emp['nombre']}: {e}")
+                logger.warning(f"Fallo generando email para {emp['nombre']}: {e}. Usando genérico.")
+                asunto  = (f"Candidatura espontánea – Desarrollador {skills['nivel']} "
+                           f"| {personal['nombre']}")
+                cuerpo  = _email_generico(config)
+                cv_path = emp.get("cv_path")
 
-        # ── GENERAR EL EMAIL PERSONALIZADO AL VUELO (usa las tecnologías) ─────
-        # Se genera aquí (no en FASE 2) para que funcione también con --solo-enviar
-        # y para incorporar el stack tecnológico recién detectado.
-        try:
-            email_data = generar_email_personalizado(emp, personal, skills, model)
-            asunto = email_data["asunto"]
-            cuerpo = email_data["cuerpo"]
-            cv_path = email_data.get("cv_path") or emp.get("cv_path")
-        except Exception as e:
-            logger.warning(f"Fallo generando email para {emp['nombre']}: {e}. Usando genérico.")
-            asunto = (f"Candidatura espontánea – Desarrollador {skills['nivel']} "
-                      f"| {personal['nombre']}")
-            cuerpo = _email_generico(config)
-            cv_path = emp.get("cv_path")
+            if not cuerpo.strip():
+                cuerpo = _email_generico(config)
 
-        if not cuerpo.strip():
-            cuerpo = _email_generico(config)
+            # Mostrar preview
+            logger.info(f"\n{'─'*50}")
+            logger.info(f"📧 ENVIANDO A: {emp['nombre']} <{emp['email']}>")
+            logger.info(f"   Asunto: {asunto}")
+            logger.info(f"   Preview: {cuerpo[:120]}...")
 
-        # Mostrar preview
-        logger.info(f"\n{'─'*50}")
-        logger.info(f"📧 ENVIANDO A: {emp['nombre']} <{emp['email']}>")
-        logger.info(f"   Asunto: {asunto}")
-        logger.info(f"   Preview: {cuerpo[:120]}...")
+            ok = sender.enviar_con_pausa(emp["email"], asunto, cuerpo,
+                                         cv_path=cv_path)
+            estado = "enviado" if ok else "error"
 
-        ok = sender.enviar_con_pausa(emp["email"], asunto, cuerpo,
-                                     cv_path=cv_path)
-        estado = "enviado" if ok else "error"
+            db.registrar_envio(
+                empresa_id    = emp["id"],
+                email_destino = emp["email"],
+                asunto        = asunto,
+                cuerpo        = cuerpo,
+                estado        = estado,
+            )
 
-        db.registrar_envio(
-            empresa_id    = emp["id"],
-            email_destino = emp["email"],
-            asunto        = asunto,
-            cuerpo        = cuerpo,
-            estado        = estado,
-        )
+            if ok:
+                enviados += 1
+            else:
+                errores += 1
 
-        if ok:
-            enviados += 1
-        else:
-            errores += 1
+    except KeyboardInterrupt:
+        logger.info(f"\n⚠️  Cancelado con Ctrl+C. "
+                    f"Enviados en esta sesión: {enviados}. Lo guardado está en BD.")
 
     # ── RESUMEN FINAL ──────────────────────────────────────────────────────────
     resumen = db.resumen()
