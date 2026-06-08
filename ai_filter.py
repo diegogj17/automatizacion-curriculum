@@ -6,7 +6,8 @@ Analiza empresas y genera emails personalizados para cada una
 import requests
 import logging
 import json
-from typing import List, Dict
+import re
+from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,64 @@ def _llamar_ollama(prompt: str, model: str = "mistral:latest",
     except Exception as e:
         logger.error(f"Error al llamar a Ollama: {e}")
         return ""
+
+
+def _parsear_json_ollama(respuesta: str) -> Optional[dict]:
+    """
+    Extrae {"asunto": ..., "cuerpo": ...} de la respuesta de Ollama de forma
+    robusta. Maneja los tres problemas más comunes:
+      1. Texto extra antes/después del JSON ("Aquí te presento...")
+      2. Bloque de código Markdown  (```json ... ```)
+      3. Saltos de línea LITERALES dentro de los valores del JSON
+         (JSON inválido que genera json.loads más común de Ollama)
+    Devuelve el dict o None si no se puede extraer nada útil.
+    """
+    if not respuesta:
+        return None
+
+    # 1. Quitar marcadores de bloque de código Markdown
+    texto = re.sub(r"```(?:json)?\s*", "", respuesta, flags=re.IGNORECASE).strip()
+
+    # 2. Encontrar el bloque JSON (primer { … último })
+    inicio = texto.find("{")
+    fin    = texto.rfind("}") + 1
+    if inicio == -1 or fin <= inicio:
+        return None
+    fragmento = texto[inicio:fin]
+
+    # 3. Primer intento: json.loads directo (funciona si el JSON es válido)
+    try:
+        return json.loads(fragmento)
+    except Exception:
+        pass
+
+    # 4. Segundo intento: escapar los saltos de línea LITERALES dentro de strings.
+    #    Recorremos carácter a carácter para saber si estamos dentro de un string
+    #    y solo entonces reemplazamos \n/\r/\t por sus equivalentes escapados.
+    try:
+        en_string = False
+        resultado = []
+        i = 0
+        while i < len(fragmento):
+            c = fragmento[i]
+            # Detectar inicio/fin de string (ignorando \" escapadas)
+            if c == '"' and (i == 0 or fragmento[i - 1] != "\\"):
+                en_string = not en_string
+                resultado.append(c)
+            elif en_string and c == "\n":
+                resultado.append("\\n")
+            elif en_string and c == "\r":
+                resultado.append("\\r")
+            elif en_string and c == "\t":
+                resultado.append("\\t")
+            else:
+                resultado.append(c)
+            i += 1
+        return json.loads("".join(resultado))
+    except Exception:
+        pass
+
+    return None
 
 
 def _tech_coincidentes(empresa_tecnologias, skills: dict) -> list:
@@ -165,85 +224,118 @@ def generar_email_personalizado(empresa: dict, personal: dict, skills: dict,
 
     if idioma == 'en':
         cv_path = personal.get('cv_en', personal.get('cv_path', ''))
-        prompt = f"""You are an expert HR professional and business writer in English.
+        prompt = f"""You are an expert business writer. Write a professional speculative job application email (max 180 words).
 
-Write a PERSONALIZED, professional and concise speculative job application email (max 200 words).
-
-CANDIDATE DETAILS:
+CANDIDATE:
 - Name: {personal['nombre']}
-- Speciality: {skills['nivel']} Developer in {', '.join(skills['principales'])}
-- Secondary technologies: {', '.join(skills['secundarias'])}{proyecto_str_en}
+- Level: {skills['nivel']} Developer
+- Main stack: {', '.join(skills['principales'])}
+- Also knows: {', '.join(skills['secundarias'])}{proyecto_str_en}
 - Phone: {personal['telefono']}
 
-TARGET COMPANY:
+COMPANY:
 - Name: {empresa['nombre']}
-- Description/Position found: {empresa['descripcion']}
-- City: {empresa.get('ciudad', 'Ireland')}
-- Country: {empresa.get('pais', '')}
-- Source: {empresa['fuente']}{bloque_tech_en}
+- Info: {empresa['descripcion']}
+- Location: {empresa.get('ciudad', '')}, {empresa.get('pais', '')}{bloque_tech_en}
 
-INSTRUCTIONS:
-1. Start with a professional greeting to the HR/Hiring team
-2. Mention something specific about the company or the role you found
-3. Briefly introduce the candidate and their most relevant skills
-4. Naturally mention the Flitly project as proof of real published work (available on App Store and Google Play), without including any URLs or links
-5. Mention the attached CV
-6. Close with availability for interview and contact details
-7. Tone: professional yet approachable, NOT generic
+RULES:
+1. Open with a professional greeting to the hiring team.
+2. Reference something specific about the company.
+3. Introduce the candidate and their key skills naturally.
+4. Mention Flitly (published on App Store and Google Play) as proof of real work — no URLs.
+5. Say the CV is attached.
+6. End with availability and phone number.
+7. Tone: professional but human. NOT generic.
+8. RESPOND ONLY WITH A JSON OBJECT. No explanation, no preamble, no code block.
 
-Respond in JSON format with exactly these keys:
-{{"asunto": "...", "cuerpo": "..."}}"""
+Output format (ONLY this, nothing else before or after):
+{{"asunto": "subject line here", "cuerpo": "full email body here"}}"""
     else:
         cv_path = personal.get('cv_path', '')
-        prompt = f"""Eres un experto en recursos humanos y redacción profesional en español.
+        prompt = f"""Eres un experto en redacción profesional. Escribe un email de candidatura espontánea (máx 180 palabras).
 
-Escribe un email de candidatura espontánea PERSONALIZADO, profesional y conciso (máx 200 palabras).
-
-DATOS DEL CANDIDATO:
+CANDIDATO:
 - Nombre: {personal['nombre']}
-- Especialidad: Desarrollador {skills['nivel']} en {', '.join(skills['principales'])}
-- Tecnologías secundarias: {', '.join(skills['secundarias'])}{proyecto_str_es}
+- Nivel: Desarrollador {skills['nivel']}
+- Stack principal: {', '.join(skills['principales'])}
+- También domina: {', '.join(skills['secundarias'])}{proyecto_str_es}
 - Teléfono: {personal['telefono']}
 
-EMPRESA DESTINATARIA:
+EMPRESA:
 - Nombre: {empresa['nombre']}
-- Descripción/Puesto visto: {empresa['descripcion']}
-- Ciudad: {empresa.get('ciudad', 'España')}
-- Fuente donde se encontró: {empresa['fuente']}{bloque_tech_es}
+- Info: {empresa['descripcion']}
+- Ciudad: {empresa.get('ciudad', 'España')}{bloque_tech_es}
 
-INSTRUCCIONES:
-1. Empieza con un saludo profesional al departamento de RRHH
-2. Menciona algo específico de la empresa o del puesto que encontraste
-3. Presenta brevemente al candidato y sus habilidades más relevantes
-4. Menciona de forma natural el proyecto Flitly como prueba de trabajo real publicado (disponible en App Store y Google Play), sin incluir ningún enlace ni URL
-5. Indica que adjuntas el CV
-6. Cierra con disponibilidad para entrevista y datos de contacto
-7. Tono: profesional pero cercano, NO genérico
+REGLAS:
+1. Saludo profesional al equipo de RRHH.
+2. Menciona algo concreto de la empresa.
+3. Preséntate y destaca tus skills más relevantes de forma natural.
+4. Menciona Flitly (publicada en App Store y Google Play) como prueba de trabajo real — sin URLs.
+5. Indica que adjuntas el CV.
+6. Cierra con disponibilidad y teléfono.
+7. Tono: profesional pero cercano. NADA genérico.
+8. RESPONDE ÚNICAMENTE CON EL OBJETO JSON. Sin explicación, sin preámbulo, sin bloque de código.
 
-Responde en formato JSON con exactamente estas claves:
-{{"asunto": "...", "cuerpo": "..."}}"""
+Formato de salida (SOLO esto, nada antes ni después):
+{{"asunto": "línea de asunto aquí", "cuerpo": "cuerpo del email aquí"}}"""
 
-    respuesta = _llamar_ollama(prompt, model, temperatura=0.8)
+    respuesta = _llamar_ollama(prompt, model, temperatura=0.7)
 
-    # Intentar parsear JSON
-    try:
-        # Extraer JSON aunque haya texto alrededor
-        inicio = respuesta.find("{")
-        fin    = respuesta.rfind("}") + 1
-        if inicio != -1 and fin > inicio:
-            data = json.loads(respuesta[inicio:fin])
-            return {
-                "asunto": data.get("asunto", f"Candidatura espontánea - {skills['nivel']}"),
-                "cuerpo": data.get("cuerpo", ""),
-                "cv_path": cv_path
-            }
-    except Exception:
-        pass
+    # ── Parseo robusto de la respuesta ────────────────────────────────────────
+    data = _parsear_json_ollama(respuesta)
+    if data:
+        asunto = (data.get("asunto") or "").strip()
+        cuerpo = (data.get("cuerpo") or "").strip()
+        if cuerpo:
+            if not asunto:
+                asunto = (f"Candidatura espontánea – Desarrollador {skills['nivel']} "
+                          f"| {personal['nombre']}")
+            return {"asunto": asunto, "cuerpo": cuerpo, "cv_path": cv_path}
 
-    # Fallback: usar la respuesta completa como cuerpo
-    logger.warning(f"No se pudo parsear JSON para {empresa['nombre']}, usando fallback")
-    asunto = f"Candidatura espontánea – Desarrollador {skills['nivel']} | {personal['nombre']}"
-    return {"asunto": asunto, "cuerpo": respuesta, "cv_path": cv_path}
+    # ── Fallback: pedir de nuevo con temperatura 0 y formato más simple ───────
+    logger.warning(f"JSON inválido para '{empresa['nombre']}', reintentando con T=0...")
+    prompt_simple = prompt + "\n\nIMPORTANT: your previous response could not be parsed. Return ONLY the raw JSON object, starting with { and ending with }, with NO other characters outside it."
+    respuesta2 = _llamar_ollama(prompt_simple, model, temperatura=0)
+    data2 = _parsear_json_ollama(respuesta2)
+    if data2:
+        asunto = (data2.get("asunto") or "").strip()
+        cuerpo = (data2.get("cuerpo") or "").strip()
+        if cuerpo:
+            if not asunto:
+                asunto = (f"Candidatura espontánea – Desarrollador {skills['nivel']} "
+                          f"| {personal['nombre']}")
+            return {"asunto": asunto, "cuerpo": cuerpo, "cv_path": cv_path}
+
+    # ── Último recurso: email limpio genérico (NUNCA enviar JSON crudo) ───────
+    logger.warning(f"Usando email genérico para '{empresa['nombre']}' (Ollama no devolvió JSON válido)")
+    nombre_emp = empresa.get("nombre", "")
+    if idioma == "en":
+        asunto_gen = f"Speculative Application – {skills['nivel']} Developer | {personal['nombre']}"
+        cuerpo_gen = (
+            f"Dear Hiring Team,\n\n"
+            f"I am writing to express my interest in joining {nombre_emp}. "
+            f"My name is {personal['nombre']}, a {skills['nivel']} developer "
+            f"specialised in {', '.join(skills['principales'])}.\n\n"
+            f"I have developed Flitly, a real app published on the App Store and Google Play, "
+            f"which demonstrates my ability to deliver production-ready work.\n\n"
+            f"Please find my CV attached. I would welcome the opportunity to discuss "
+            f"how I can contribute to your team.\n\n"
+            f"Best regards,\n{personal['nombre']}\n{personal['telefono']}"
+        )
+    else:
+        asunto_gen = (f"Candidatura espontánea – Desarrollador {skills['nivel']} "
+                      f"| {personal['nombre']}")
+        cuerpo_gen = (
+            f"Estimado equipo de RRHH,\n\n"
+            f"Me pongo en contacto para presentar mi candidatura en {nombre_emp}. "
+            f"Soy {personal['nombre']}, desarrollador {skills['nivel']} "
+            f"especializado en {', '.join(skills['principales'])}.\n\n"
+            f"Entre mis proyectos destaca Flitly, una app publicada en App Store y "
+            f"Google Play, que demuestra mi capacidad para llevar proyectos reales a producción.\n\n"
+            f"Adjunto mi CV. Quedo disponible para cualquier entrevista.\n\n"
+            f"Un saludo,\n{personal['nombre']}\n{personal['telefono']}"
+        )
+    return {"asunto": asunto_gen, "cuerpo": cuerpo_gen, "cv_path": cv_path}
 
 
 def filtrar_y_personalizar(empresas: List[Dict], config: dict) -> List[Dict]:
